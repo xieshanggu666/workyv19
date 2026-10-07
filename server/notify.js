@@ -51,8 +51,8 @@ function addLog(taskId, action, detail, operator = '系统') {
 }
 
 // ===== 任务生成（订阅匹配 → 多渠道并行任务；幂等键去重，重复触发不产生重复任务） =====
-// opts.kind: alert（预警）/ crisis（危机状态）/ workorder（协同工单事件）/ prop（传播路径事件）/ ext（外部协作门户事件）/ statement（危机声明渠道事件）
-function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKey = '', woId = null, woEvent = '', propPathId = null, extSubmissionId = null, statementId = null, idemTag = '', corrId = '', corrSeq = 0, title, content }) {
+// opts.kind: alert（预警）/ crisis（危机状态）/ workorder（协同工单事件）/ prop（传播路径事件）/ ext（外部协作门户事件）/ statement（危机声明渠道事件）/ rect（危机整改事项事件）
+function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKey = '', woId = null, woEvent = '', propPathId = null, extSubmissionId = null, statementId = null, rectId = null, idemTag = '', corrId = '', corrSeq = 0, title, content }) {
   const created = []
   const ts = now()
   for (const chId of subChannels(sub)) {
@@ -63,14 +63,15 @@ function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKe
       : kind === 'prop' ? `prop:${propPathId}:${idemTag}`
       : kind === 'ext' ? `ext:${extSubmissionId}:${idemTag}`
       : kind === 'statement' ? `stmt:${statementId}:${idemTag}`
+      : kind === 'rect' ? `rect:${rectId}:${idemTag}`
       : `crisis:${crisisId}:${statusKey}`
     const r = run(`INSERT OR IGNORE INTO notify_tasks
-      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,require_ack,work_order_id,wo_event,prop_path_id,ext_submission_id,statement_id,corr_id,seq,created,updated)
-      VALUES (?,?,?,?,?,?,?,?,'pending',0,?,?,?,?,?,?,?,?,?,?,?)`,
+      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,require_ack,work_order_id,wo_event,prop_path_id,ext_submission_id,statement_id,rect_id,corr_id,seq,created,updated)
+      VALUES (?,?,?,?,?,?,?,?,'pending',0,?,?,?,?,?,?,?,?,?,?,?,?)`,
       `${src}:sub${sub.id}:ch${chId}`, sub.id, chId, alertEventId, crisisId,
       kind === 'workorder' ? 'workorder' : kind, title, content,
       Math.max(1, sub.max_retry || 3), sub.require_ack ? 1 : 0, woId,
-      woEvent === '' || woEvent == null ? '' : String(woEvent), propPathId, extSubmissionId, statementId,
+      woEvent === '' || woEvent == null ? '' : String(woEvent), propPathId, extSubmissionId, statementId, rectId,
       corrId || '', corrSeq, ts, ts)
     if (Number(r.changes)) {
       const id = Number(r.lastInsertRowid)
@@ -328,6 +329,89 @@ export function seedStatementNotifyTasks() {
   return n
 }
 
+// ===== 危机整改事项事件 → 通知任务（rect_event：assigned 分派跟进 / progress 进度报送 / submitted 申请验收 / rejected 验收驳回 / accepted 验收通过） =====
+// 复用通知渠道、失败退避重试、回执与升级调度；幂等键按 整改项×事件（×轮次）×订阅×渠道 去重。
+export const RECT_EVENT_TEXT = {
+  assigned: '整改事项分派跟进', progress: '整改进度报送', submitted: '整改申请验收',
+  rejected: '整改验收驳回', accepted: '整改验收通过'
+}
+export function generateForRectification(rectId, rectEvent, extra = {}) {
+  const r = q1(`SELECT rc.*, c.title crisis_title, c.topic crisis_topic, p.name partner_name
+    FROM rectifications rc LEFT JOIN crisis c ON c.id=rc.crisis_id
+    LEFT JOIN ext_partners p ON p.id=rc.partner_id WHERE rc.id=?`, rectId)
+  if (!r) return []
+  const all = []
+  const subs = q(`SELECT * FROM notify_subs WHERE active=1 AND rect_event=?`, rectEvent)
+  if (!subs.length) return []
+  const topic = r.crisis_topic || ''
+  const kindLabel = { brand: '品牌方', regulator: '监管方', media: '媒体' }[r.kind] || '协作方'
+  const titleMap = {
+    assigned: '【整改事项分派】', progress: '【整改进度报送】', submitted: '【整改申请验收】',
+    rejected: '【整改验收驳回】', accepted: '【整改验收通过】'
+  }
+  const title = `${titleMap[rectEvent] || '【整改事项】'}${r.title}`
+  // 幂等粒度：分派按「轮次×协作方」（改派可再次触达）；进度按报送条目；验收/驳回按验收轮次；通过按事项幂等
+  let idemTag
+  let corrId = `rect${r.id}:${rectEvent}`
+  let corrSeq = 0
+  const baseBits = [`整改事项 ${r.code}`, `危机「${r.crisis_title || '#' + r.crisis_id}」`]
+  if (rectEvent === 'assigned') {
+    corrSeq = Math.max(0, +extra.dispatchSeq || 0)
+    idemTag = `assigned:${corrSeq}:${extra.to || r.partner_id || ''}`
+  } else if (rectEvent === 'progress') {
+    idemTag = `progress:${extra.progressId || 'p' + (r.progress_count || 0)}`
+  } else if (rectEvent === 'rejected') {
+    corrSeq = Math.max(1, +extra.round || r.review_round || 1)
+    idemTag = `rejected:${corrSeq}`
+  } else if (rectEvent === 'submitted') {
+    corrSeq = Math.max(1, +extra.round || r.review_round || 1)
+    idemTag = `submitted:${corrSeq}`
+  } else {
+    idemTag = 'accepted'
+  }
+  const contentBits = {
+    assigned: () => baseBits.concat([
+      `已分派给${kindLabel}（${r.partner_name || '待选定协作方'}）跟进整改`,
+      r.due_at ? `整改期限 ${new Date(r.due_at).toLocaleString('zh-CN')}` : '未设定期限',
+      extra.operator ? `分派值班员：${extra.operator}` : ''
+    ]),
+    progress: () => baseBits.concat([
+      `${kindLabel}（${r.partner_name || '—'}）报送第 ${r.progress_count || 0} 期整改进度`,
+      extra.summary ? `摘要：${extra.summary}` : ''
+    ]),
+    submitted: () => baseBits.concat([
+      `${kindLabel}（${r.partner_name || '—'}）完成整改并申请验收（第 ${r.review_round || corrSeq} 轮），待管理员验收`
+    ]),
+    rejected: () => baseBits.concat([
+      `管理员验收驳回（第 ${r.review_round || corrSeq} 轮），退回${kindLabel}继续整改`,
+      extra.reason ? `驳回原因：${extra.reason}` : ''
+    ]),
+    accepted: () => baseBits.concat([
+      `管理员已验收通过（${extra.operator || r.verified_by || '管理员'}），整改闭环`
+    ])
+  }
+  const content = contentBits[rectEvent]().filter(Boolean).join(' · ')
+  for (const sub of subs) {
+    if (sub.topic && sub.topic !== topic) continue
+    all.push(...createTasks(sub, {
+      kind: 'rect', rectId: r.id, crisisId: r.crisis_id, woId: r.work_order_id || null,
+      idemTag, corrId, corrSeq, title, content
+    }))
+  }
+  return all
+}
+
+// 启动时为存量待办整改项补生成通知任务（幂等：重复启动不产生重复任务）
+// · 待验收：补「申请验收待办」；· 已驳回（整改中）：补最后一轮驳回通知；· 待分派：不补（分派是即时动作）
+export function seedRectNotifyTasks() {
+  let n = 0
+  for (const r of q("SELECT id, review_round, status FROM rectifications WHERE status IN ('reviewing','rejected')")) {
+    if (r.status === 'reviewing') n += generateForRectification(r.id, 'submitted', { round: Math.max(1, r.review_round) }).length
+    if (r.status === 'rejected') n += generateForRectification(r.id, 'rejected', { round: Math.max(1, r.review_round) }).length
+  }
+  return n
+}
+
 // ===== 模拟发送（演示）：渠道地址含 always-fail 持续失败、含 flaky 首次失败（验证自动重试） =====
 function mockSend(ch, attempts) {
   const target = ch.target || ''
@@ -392,21 +476,21 @@ function escalateTask(t) {
     addLog(t.id, 'escalated', `回执超时未确认，通知升级至渠道「${ch ? ch.name : '已删除'}」`)
     // 升级子任务继承来源链路的全部关联键：
     //   corr_id/seq 与来源任务同根；alert_event_id/work_order_id/wo_event 随工单链路追踪；
-    //   prop_path_id/ext_submission_id 必须一并继承——否则传播路径、外部协作来源在升级后丢失，
+    //   prop_path_id/ext_submission_id/rect_id 必须一并继承——否则传播路径、外部协作、整改事项来源在升级后丢失，
     //   会导致危机删除级联误判（来源保留任务无法按来源识别）、复盘统计与门户追踪口径不一致。
     // 危机引用按「来源对象当前归属」重新解析：父任务创建后危机可能已被删除（引用悬空），
-    // 而传播路径/外部提交保留且挂有现存危机时，升级链仍应归属该危机（时间线/统计同源）。
-    const { crisisId: resolvedCrisisId, propPathId, extSubmissionId, statementId } = resolveTaskSources(t)
+    // 而传播路径/外部提交/整改事项保留且挂有现存危机时，升级链仍应归属该危机（时间线/统计同源）。
+    const { crisisId: resolvedCrisisId, propPathId, extSubmissionId, statementId, rectId } = resolveTaskSources(t)
     const childCorr = t.corr_id
       ? (/:(escalate|ackEsc)/.test(t.corr_id) ? t.corr_id : `${t.corr_id}:ackEsc`)
       : (t.work_order_id ? `wo${t.work_order_id}:ackEsc:${t.id}` : `task${t.id}:ackEsc`)
     const cr = run(`INSERT OR IGNORE INTO notify_tasks
-      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,next_retry_at,require_ack,escalated_from,work_order_id,wo_event,prop_path_id,ext_submission_id,statement_id,corr_id,seq,created,updated)
-      VALUES (?,?,?,?,?,?,?,?, 'pending',0,?,NULL,?, ?,?,?,?,?,?,?,?,?,?)`,
+      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,next_retry_at,require_ack,escalated_from,work_order_id,wo_event,prop_path_id,ext_submission_id,statement_id,rect_id,corr_id,seq,created,updated)
+      VALUES (?,?,?,?,?,?,?,?, 'pending',0,?,NULL,?, ?,?,?,?,?,?,?,?,?,?,?)`,
       `esc:${t.id}:ch${chId}`, t.sub_id, chId, t.alert_event_id, resolvedCrisisId, t.kind,
       `【升级】${t.title}`, t.content,
       Math.max(1, t.max_attempts), t.require_ack, t.id,
-      t.work_order_id, t.wo_event, propPathId, extSubmissionId, statementId, childCorr, (t.seq || 0) + 1, ts, ts)
+      t.work_order_id, t.wo_event, propPathId, extSubmissionId, statementId, rectId, childCorr, (t.seq || 0) + 1, ts, ts)
     if (Number(cr.changes)) {
       const childId = Number(cr.lastInsertRowid)
       addLog(childId, 'created', `任务 #${t.id} 回执超时升级生成`)
@@ -414,8 +498,8 @@ function escalateTask(t) {
     if (resolvedCrisisId) {
       const c = q1('SELECT status FROM crisis WHERE id=?', resolvedCrisisId)
       if (c && c.status !== 'closed') {
-        const refType = t.work_order_id ? 'workorder' : statementId ? 'statement' : 'notify'
-        const refId = t.work_order_id || statementId || t.id
+        const refType = t.work_order_id ? 'workorder' : rectId ? 'rect' : statementId ? 'statement' : 'notify'
+        const refId = t.work_order_id || rectId || statementId || t.id
         addDispatchTimeline(resolvedCrisisId, '通知升级',
           `通知「${t.title}」回执超时未确认，已升级至渠道「${ch ? ch.name : '—'}」`,
           { woId: t.work_order_id, refType, refId, time: ts })
@@ -432,6 +516,7 @@ function escalateTask(t) {
 // 升级链上的任务以父任务为准；父任务来源缺失（历史升级任务）时回查来源对象补齐：
 //   · prop：传播路径（删除危机时路径保留，crisis_id 可能已被解除后重新挂接）
 //   · ext ：外部协作提交（跨主体留痕，删除危机时仅解除引用）
+//   · rect：危机整改事项（跨主体整改留痕，删除危机时仅解除引用）
 //   · alert：预警触发记录（删除危机时仅解除引用，crisis_id 恒为现存危机或 NULL）
 //   · workorder：工单随危机删除，不存在悬空引用
 function resolveTaskSources(t) {
@@ -439,6 +524,7 @@ function resolveTaskSources(t) {
   let propPathId = t.prop_path_id ?? null
   let extSubmissionId = t.ext_submission_id ?? null
   let statementId = t.statement_id ?? null
+  let rectId = t.rect_id ?? null
   if (t.kind === 'prop' || propPathId) {
     if (!propPathId && t.escalated_from) {
       const p = q1('SELECT prop_path_id FROM notify_tasks WHERE id=?', t.escalated_from)
@@ -459,6 +545,16 @@ function resolveTaskSources(t) {
       if (s) crisisId = s.crisis_id ?? null
       else { extSubmissionId = null; crisisId = null }
     }
+  } else if (t.kind === 'rect' || rectId) {
+    if (!rectId && t.escalated_from) {
+      const p = q1('SELECT rect_id FROM notify_tasks WHERE id=?', t.escalated_from)
+      rectId = p ? p.rect_id ?? null : null
+    }
+    if (rectId) {
+      const rc = q1('SELECT crisis_id FROM rectifications WHERE id=?', rectId)
+      if (rc) crisisId = rc.crisis_id ?? null
+      else { rectId = null; crisisId = null }
+    }
   } else if (t.kind === 'statement' || statementId) {
     if (!statementId && t.escalated_from) {
       const p = q1('SELECT statement_id FROM notify_tasks WHERE id=?', t.escalated_from)
@@ -475,7 +571,7 @@ function resolveTaskSources(t) {
   }
   // 悬空的危机引用（危机已删除）一律解除，避免幽灵任务与脏统计
   if (crisisId && !q1('SELECT 1 FROM crisis WHERE id=?', crisisId)) crisisId = null
-  return { crisisId: crisisId ?? null, propPathId: propPathId ?? null, extSubmissionId: extSubmissionId ?? null, statementId: statementId ?? null }
+  return { crisisId: crisisId ?? null, propPathId: propPathId ?? null, extSubmissionId: extSubmissionId ?? null, statementId: statementId ?? null, rectId: rectId ?? null }
 }
 
 // 调度一轮：到期发送/重试 + 回执超时升级（导出供测试与手动触发）
@@ -570,11 +666,12 @@ export function ackTask(id, actor, note = '') {
   }
   const ts = now()
   let resolved = 0
-  // 升级子任务可能携带与父任务一致的来源（prop_path_id/ext_submission_id）；危机归属按来源对象
+  // 升级子任务可能携带与父任务一致的来源（prop_path_id/ext_submission_id/rect_id）；危机归属按来源对象
   // 当前归属解析，避免对已删除危机写时间线、并保证回执统计与门户/路径追踪同口径。
   const src = resolveTaskSources(t)
   let crisisId = src.crisisId
   const statementId = src.statementId
+  const rectId = src.rectId
   db.exec('BEGIN')
   try {
     const r = run(`UPDATE notify_tasks SET status='acked', ack_by=?, ack_at=?, ack_note=?, updated=?
@@ -599,9 +696,11 @@ export function ackTask(id, actor, note = '') {
     if (crisisId) {
       const c = q1('SELECT status FROM crisis WHERE id=?', crisisId)
       if (c && c.status !== 'closed') {
+        const refType = t.work_order_id ? 'workorder' : rectId ? 'rect' : statementId ? 'statement' : 'notify'
+        const refId = t.work_order_id || rectId || statementId || t.id
         addDispatchTimeline(crisisId, '通知回执',
           `通知「${t.title}」已由 ${actor.user} 确认回执${note ? `：${note}` : ''}${resolved ? '，同步解除关联预警' : ''}`,
-          { woId: t.work_order_id, refType: t.work_order_id ? 'workorder' : statementId ? 'statement' : 'notify', refId: t.work_order_id || statementId || t.id, time: ts })
+          { woId: t.work_order_id, refType, refId, time: ts })
       }
     }
     db.exec('COMMIT')
@@ -635,6 +734,7 @@ export function healNotifySourceLinks() {
     let alertEventId = t.alert_event_id ?? null
     let workOrderId = t.work_order_id ?? null
     let statementId = t.statement_id ?? null
+    let rectId = t.rect_id ?? null
     // ① 沿升级链（一层）从父任务继承缺失的来源键；work_order_id/wo_event/kind 同样兜底
     if (parent) {
       if (!propPathId) propPathId = parent.prop_path_id ?? null
@@ -642,6 +742,7 @@ export function healNotifySourceLinks() {
       if (!alertEventId) alertEventId = parent.alert_event_id ?? null
       if (!workOrderId) workOrderId = parent.work_order_id ?? null
       if (!statementId) statementId = parent.statement_id ?? null
+      if (!rectId) rectId = parent.rect_id ?? null
     }
     const kind = parent && parent.kind !== 'alert' && t.kind === 'alert' ? parent.kind : t.kind
     const woEvent = t.wo_event || (parent ? parent.wo_event || '' : '')
@@ -657,6 +758,11 @@ export function healNotifySourceLinks() {
       const s = extSubmissionId ? q1('SELECT crisis_id FROM ext_submissions WHERE id=?', extSubmissionId) : null
       if (extSubmissionId && !s) isOrphan = true
       else sourceCrisis = s ? s.crisis_id ?? null : null
+    } else if (kind === 'rect' || rectId) {
+      // 整改项跨主体保留：危机删除仅解除引用；整改项本身被物理删除才是孤儿
+      const rc = rectId ? q1('SELECT crisis_id FROM rectifications WHERE id=?', rectId) : null
+      if (rectId && !rc) isOrphan = true
+      else sourceCrisis = rc ? rc.crisis_id ?? null : null
     } else if (kind === 'statement' || statementId) {
       // 声明随危机物理删除：声明类任务（含升级链）无来源可追溯 → 孤儿删除
       const st = statementId ? q1('SELECT crisis_id FROM crisis_statements WHERE id=?', statementId) : null
@@ -687,12 +793,13 @@ export function healNotifySourceLinks() {
       || alertEventId !== (t.alert_event_id ?? null)
       || workOrderId !== (t.work_order_id ?? null)
       || statementId !== (t.statement_id ?? null)
+      || rectId !== (t.rect_id ?? null)
       || kind !== t.kind || woEvent !== (t.wo_event || '')
     if (changed) {
       run(`UPDATE notify_tasks SET crisis_id=?, prop_path_id=?, ext_submission_id=?, alert_event_id=?,
-        work_order_id=?, statement_id=?, kind=?, wo_event=? WHERE id=?`,
+        work_order_id=?, statement_id=?, rect_id=?, kind=?, wo_event=? WHERE id=?`,
         crisisId ?? null, propPathId ?? null, extSubmissionId ?? null, alertEventId ?? null,
-        workOrderId ?? null, statementId ?? null, kind, woEvent, t.id)
+        workOrderId ?? null, statementId ?? null, rectId ?? null, kind, woEvent, t.id)
       healed += 1
     }
   }
@@ -739,17 +846,18 @@ export function deleteNotifyOfCrisis(crisisId) {
     for (const r of q(`SELECT id FROM notify_tasks WHERE statement_id IN (${ph})`, ...stmtIds)) delIds.add(r.id)
   }
   // 升级链：被删任务的升级子任务中，来源随事件删除（工单/声明/危机/无来源继承）的一并删除；
-  // 来源保留（传播路径/外部提交/预警触发）的升级子任务保留，仅在最后随父任务解除危机引用。
+  // 来源保留（传播路径/外部提交/整改事项/预警触发）的升级子任务保留，仅在最后随父任务解除危机引用。
   for (;;) {
     const ids = [...delIds]
     if (!ids.length) break
     const ph = ids.map(() => '?').join(',')
-    const fresh = q(`SELECT id, kind, prop_path_id, ext_submission_id, alert_event_id, statement_id
+    const fresh = q(`SELECT id, kind, prop_path_id, ext_submission_id, rect_id, alert_event_id, statement_id
       FROM notify_tasks WHERE escalated_from IN (${ph})`, ...ids).filter((r) => !delIds.has(r.id))
     if (!fresh.length) break
     for (const r of fresh) {
       const sourceKept = (r.kind === 'prop' && r.prop_path_id && q1('SELECT 1 FROM prop_paths WHERE id=?', r.prop_path_id))
         || (r.kind === 'ext' && r.ext_submission_id && q1('SELECT 1 FROM ext_submissions WHERE id=?', r.ext_submission_id))
+        || (r.kind === 'rect' && r.rect_id && q1('SELECT 1 FROM rectifications WHERE id=?', r.rect_id))
         || (r.alert_event_id && q1('SELECT 1 FROM alert_events WHERE id=?', r.alert_event_id))
       if (!sourceKept) delIds.add(r.id)
     }
@@ -841,7 +949,9 @@ export function validateSub(b) {
   if (ee && !['submitted', 'escalated'].includes(ee)) return '外部协作事件无效（submitted/escalated）'
   const se = String(b.stmt_event || '')
   if (se && !['chfail', 'partial', 'degraded'].includes(se)) return '危机声明事件无效（chfail/partial/degraded）'
-  if ([we, pe, ee, se, cs].filter(Boolean).length > 1) return '预警/危机/工单/传播/外部协作/声明事件订阅互斥，请只选一种匹配方式'
+  const re = String(b.rect_event || '')
+  if (re && !['assigned', 'progress', 'submitted', 'rejected', 'accepted'].includes(re)) return '整改事项事件无效（assigned/progress/submitted/rejected/accepted）'
+  if ([we, pe, ee, se, re, cs].filter(Boolean).length > 1) return '预警/危机/工单/传播/外部协作/声明/整改事件订阅互斥，请只选一种匹配方式'
   const chs = Array.isArray(b.channel_ids) ? b.channel_ids.map(Number).filter(Number.isInteger) : []
   if (!chs.length) return '至少选择一个通知渠道'
   for (const id of chs) if (!q1('SELECT 1 FROM notify_channels WHERE id=?', id)) return `渠道 #${id} 不存在`

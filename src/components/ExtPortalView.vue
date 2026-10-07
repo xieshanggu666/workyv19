@@ -100,6 +100,8 @@
             <button v-if="['pending','rejected'].includes(s.status)" class="op receive" @click="receive(s)">📥 {{ s.status==='rejected' ? '重新受理' : '受理' }}</button>
             <button v-if="['pending','reviewing','rejected'].includes(s.status) && isAdmin" class="op accept" @click="openAccept(s)">✔ 审核采纳</button>
             <button v-if="['pending','reviewing','rejected'].includes(s.status) && isAdmin" class="op reject" @click="openReject(s)">↩ 驳回</button>
+            <!-- 督办/整改类反馈：一键新建整改事项并预填分派该协作方（历史提交不消失，仍可正常受理/采纳） -->
+            <button v-if="s.crisis_id" class="op rect" @click="openRect(s)">🧹 新建整改事项</button>
             <button v-if="!s.crisis_id && s.status!=='withdrawn'" class="op bind" @click="openBind(s)">🔗 挂接危机</button>
             <button v-if="s.crisis_id && ['pending','reviewing','rejected'].includes(s.status)" class="op bind" @click="openBind(s)">改挂危机</button>
           </template>
@@ -165,6 +167,26 @@
         </div>
       </div>
     </div>
+
+    <!-- 由外部提交新建整改事项弹窗（预填协作方/危机/来源提交） -->
+    <div v-if="rectForm" class="modal-mask" @click.self="rectForm=null">
+      <div class="modal">
+        <h4>🧹 新建整改事项 · 来源 {{ rectForm.code }}</h4>
+        <p class="modal-hint">将为危机「{{ rectForm.crisis_title }}」建立整改事项并分派给 <b>{{ rectForm.partner_name }}</b>；该外部提交仍保留在协作看板，可继续受理/采纳。</p>
+        <input v-model="rectDraft.title" :placeholder="'整改要求标题，如 落实'+kindText(rectForm.kind)+'整改要求'" required />
+        <textarea v-model="rectDraft.requirement" placeholder="整改要求/依据：可先引用该提交的督办内容，补充整改项、完成标准与报送时限…"></textarea>
+        <div class="row">
+          <select v-model="rectDraft.priority">
+            <option value="urgent">紧急</option><option value="high">高</option><option value="normal">普通</option>
+          </select>
+          <input v-model="rectDraft.due" type="datetime-local" title="整改期限（可留空）" />
+        </div>
+        <div class="modal-ops">
+          <button class="save" @click="confirmRect">建立并分派</button>
+          <button class="ghost" @click="rectForm=null">取消</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -196,6 +218,8 @@ const rejectForm = ref(null)
 const rejectReason = ref('')
 const bindForm = ref(null)
 const bindCrisisId = ref(null)
+const rectForm = ref(null)
+const rectDraft = ref({ title: '', requirement: '', priority: 'urgent', due: '' })
 
 function roleText(r) { return { admin: '管理员', ops: '值班员', viewer: '观察员' }[r] || r }
 function kindText(k) { return dict.value.kind[k] || k }
@@ -267,6 +291,30 @@ async function confirmBind() {
   await store.bindExtCrisis(bindForm.value.id, bindCrisisId.value)
   bindForm.value = null
   reload(); loadPartners()
+}
+// 由督办/整改类外部提交一键建立整改事项（预填：危机、协作方、来源提交）
+function openRect(s) {
+  rectForm.value = s
+  rectDraft.value = {
+    title: s.doc_type === 'rectify' ? s.title : `落实「${s.title.slice(0, 24)}」整改要求`,
+    requirement: s.content || '',
+    priority: s.is_urgent ? 'urgent' : 'high',
+    due: ''
+  }
+}
+async function confirmRect() {
+  if (!rectDraft.value.title.trim()) { store.msg('请填写整改事项标题', 'warn'); return }
+  await store.createRectification({
+    crisis_id: rectForm.value.crisis_id,
+    partner_id: rectForm.value.partner_id,
+    source_submission_id: rectForm.value.id,
+    title: rectDraft.value.title,
+    requirement: rectDraft.value.requirement,
+    priority: rectDraft.value.priority,
+    due_at: rectDraft.value.due ? new Date(rectDraft.value.due).getTime() : null
+  })
+  rectForm.value = null
+  reload()
 }
 
 async function toggleLogs(s) {
@@ -368,6 +416,7 @@ onUnmounted(() => { clearInterval(timer); store.extFilterCrisis = null; store.ex
 .op.accept{border:1px solid #43a047;color:#a5d6a7;font-weight:600;}
 .op.reject{border:1px solid #8e24aa;color:#ce93d8;}
 .op.bind{border:1px solid #5b82c0;color:#90caf9;}
+.op.rect{border:1px solid #26a69a;color:#80cbc4;font-weight:600;}
 .logbtn{border:1px solid rgba(120,160,220,0.35);color:#aebadd;}
 .s-logs{margin-top:10px;border-top:1px dashed rgba(120,160,220,0.18);padding-top:8px;display:flex;flex-direction:column;gap:5px;max-height:230px;overflow-y:auto;}
 .slog{display:flex;gap:10px;align-items:baseline;font-size:12px;flex-wrap:wrap;}
@@ -384,6 +433,8 @@ onUnmounted(() => { clearInterval(timer); store.extFilterCrisis = null; store.ex
 .modal-hint{margin:0;font-size:12px;color:#8ba2c8;line-height:1.6;}
 .modal label{font-size:12px;color:#aebadd;}
 .modal select,.modal textarea{background:#13233f;border:1px solid rgba(120,160,220,0.25);color:#dbe4f3;border-radius:8px;padding:9px 11px;font-size:13px;font-family:inherit;}
+.modal .row{display:flex;gap:8px;flex-wrap:wrap;}
+.modal .row>*{flex:1;min-width:160px;}
 .modal textarea{min-height:90px;resize:vertical;}
 .check{display:flex;align-items:center;gap:8px;}
 .modal-ops{display:flex;gap:10px;justify-content:flex-end;}

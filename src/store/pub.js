@@ -43,6 +43,8 @@ export const usePubStore = defineStore('pub', {
     stmtOpenId: null,        // 跳转声明页时自动展开详情
     extOpenId: null,         // 从危机时间线锚点带入的待展开外部提交 id
     extFilterCrisis: null,   // 从危机卡片跳转外部协作看板带入的危机过滤
+    rectOpenId: null,        // 从危机时间线锚点/卡片带入的待展开整改事项 id
+    rectFilterCrisis: null,  // 从危机卡片跳转整改看板带入的危机过滤
     toast: null
   }),
   actions: {
@@ -391,6 +393,54 @@ export const usePubStore = defineStore('pub', {
       const r = await portalApi(`/submissions/${id}/withdraw`, 'POST', { reason })
       await this.load()
       this.msg('提交已撤回', 'info')
+      return r
+    },
+    // ===== 危机整改事项（内部看板 + 外部门户） =====
+    async fetchRectifications(filter) { return await api('/rectifications', 'GET', null, filter) },
+    async fetchRectification(id) { return (await api(`/rectifications/${id}`)).rectification },
+    async createRectification(body) {
+      const r = await api('/rectifications', 'POST', body)
+      await this.load()
+      this.msg(`整改事项 ${r.code} 已建立${r.status === 'rectifying' ? '并分派协作方跟进' : '，待值班员分派'}`, 'success')
+      return r
+    },
+    async dispatchRectification(id, body) {
+      const r = await api(`/rectifications/${id}/dispatch`, 'POST', body)
+      await this.load()
+      this.msg('已分派协作方跟进整改', 'success')
+      return r
+    },
+    async openRectWorkOrder(id, body) {
+      const r = await api(`/rectifications/${id}/work-order`, 'POST', body)
+      await this.load()
+      this.msg(`已拆分跟进协同工单 #${r.workOrderId}`, 'success')
+      return r
+    },
+    async cancelRectification(id, reason) {
+      const r = await api(`/rectifications/${id}/cancel`, 'POST', { reason })
+      await this.load()
+      this.msg('整改事项已取消，不再阻断结案', 'info')
+      return r
+    },
+    async verifyRectification(id, body) {
+      const r = await api(`/rectifications/${id}/verify`, 'POST', body)
+      await this.load()
+      this.msg(`整改事项已验收通过${r.resolved ? `，联动解除 ${r.resolved} 条预警` : ''}，整改闭环`, 'success')
+      return r
+    },
+    async rejectRectification(id, reason) {
+      const r = await api(`/rectifications/${id}/reject`, 'POST', { reason })
+      await this.load()
+      this.msg('已驳回，退回协作方继续整改（门户可见驳回原因）', 'info')
+      return r
+    },
+    // 门户端
+    async portalRectList() { return await portalApi('/rectifications') },
+    async portalRectFetch(id) { return (await portalApi(`/rectifications/${id}`)).rectification },
+    async portalRectProgress(id, body) {
+      const r = await portalApi(`/rectifications/${id}/progress`, 'POST', body)
+      await this.load()
+      this.msg(r.status === 'reviewing' ? `已报送并申请验收（第 ${r.reviewRound} 轮），等待管理员验收` : '整改进度已报送', 'success')
       return r
     }
   }

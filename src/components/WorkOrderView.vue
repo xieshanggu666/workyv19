@@ -174,7 +174,7 @@ function logText(a) {
   return {
     created: '拆分', assigned: '分派', claimed: '认领', started: '开始', blocked: '阻塞',
     unblocked: '恢复', done: '完成', rework: '回退', cancelled: '取消', escalated: '升级',
-    ext: '外部回写', stmt: '声明进度',
+    ext: '外部回写', stmt: '声明进度', rect: '整改进度',
     notify_sent: '通知送达', notify_retry: '通知重试', notify_failed: '通知失败',
     notify_acked: '通知回执', notify_escalated: '回执升级', notify_cancelled: '通知取消',
     notify_paused: '通知暂停', notify_resumed: '通知恢复'

@@ -193,6 +193,7 @@ export function crisisSubmissionBrief(crisisId) {
 }
 
 // 门户首页：协作方信息 + 可关联的未结案危机（只读标题/级别/状态）
+// 协作方的整改事项由 index.js 在路由层合并返回（避免 portal ↔ rectifications 循环依赖）
 export function portalBootstrap(partner) {
   const crises = q("SELECT id,title,level,status,topic FROM crisis WHERE status!='closed' ORDER BY id DESC")
     .map((c) => ({ ...c, levelText: { red: '红色', orange: '橙色', yellow: '黄色' }[c.level] || c.level }))

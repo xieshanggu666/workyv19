@@ -186,13 +186,42 @@ export function buildSnapshot(crisisId) {
     }))
   }
 
+  // ---- 危机整改事项：协作方整改闭环（分派/进度报送/验收通过/驳回，含进度条数与逾期口径） ----
+  const rectRows = q(`SELECT rc.*, p.name partner_name FROM rectifications rc
+    LEFT JOIN ext_partners p ON p.id=rc.partner_id WHERE rc.crisis_id=? ORDER BY rc.id ASC`, crisisId)
+  const nowMsRect = Date.now()
+  const rectifications = {
+    total: rectRows.length,
+    open: rectRows.filter((r) => ['pending', 'rectifying', 'reviewing', 'rejected'].includes(r.status)).length,
+    accepted: rectRows.filter((r) => r.status === 'accepted').length,
+    reviewing: rectRows.filter((r) => r.status === 'reviewing').length,
+    rejected: rectRows.filter((r) => r.status === 'rejected').length,
+    cancelled: rectRows.filter((r) => r.status === 'cancelled').length,
+    overdue: rectRows.filter((r) => ['pending', 'rectifying', 'reviewing', 'rejected'].includes(r.status) && r.due_at != null && r.due_at < nowMsRect).length,
+    progressCount: rectRows.reduce((a, r) => a + (r.progress_count || 0), 0),
+    items: rectRows.map((r) => {
+      const progress = q('SELECT id,content,source_url,submit_for_review,submitted_by,created FROM rect_progress WHERE rect_id=? ORDER BY id ASC', r.id)
+      return {
+        id: r.id, code: r.code, title: r.title, status: r.status, priority: r.priority, requirement: r.requirement,
+        kind: r.kind, partner_name: r.partner_name, work_order_id: r.work_order_id,
+        due_at: r.due_at, overdue: ['pending', 'rectifying', 'reviewing', 'rejected'].includes(r.status) && r.due_at != null && r.due_at < nowMsRect,
+        dispatched_by: r.dispatched_by, dispatched_at: r.dispatched_at,
+        review_round: r.review_round, rejected_count: r.rejected_count, progress_count: r.progress_count,
+        verified_by: r.verified_by, verified_at: r.verified_at, verify_note: r.verify_note,
+        cancel_reason: r.cancel_reason, created: r.created,
+        latestProgress: progress.length ? progress[progress.length - 1] : null,
+        progress: progress.map((p) => ({ ...p, submit_for_review: !!p.submit_for_review }))
+      }
+    })
+  }
+
   return {
     generatedAt: now(),
     crisis: {
       id: c.id, title: c.title, level: c.level, status: c.status, topic: c.topic,
       keyword: c.keyword, origin: c.origin, created: c.created, updated: c.updated
     },
-    alerts, timeline, propagation, workOrders, notifications, closures, statements, externalFeedback
+    alerts, timeline, propagation, workOrders, notifications, closures, statements, externalFeedback, rectifications
   }
 }
 

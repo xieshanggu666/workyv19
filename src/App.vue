@@ -24,6 +24,7 @@
       <StatementsView v-else-if="tab==='stmt'" />
       <WorkOrderView v-else-if="tab==='work'" />
       <ReportsView v-else-if="tab==='report'" />
+      <RectificationsView v-else-if="tab==='rect'" />
       <ExtPortalView v-else-if="tab==='ext'" />
       <PartnerPortalView v-else-if="tab==='portal'" />
       <NotifyView v-else-if="tab==='notify'" />
@@ -47,6 +48,7 @@ import CrisisView from '@/components/CrisisView.vue'
 import StatementsView from '@/components/StatementsView.vue'
 import WorkOrderView from '@/components/WorkOrderView.vue'
 import ReportsView from '@/components/ReportsView.vue'
+import RectificationsView from '@/components/RectificationsView.vue'
 import ExtPortalView from '@/components/ExtPortalView.vue'
 import PartnerPortalView from '@/components/PartnerPortalView.vue'
 import NotifyView from '@/components/NotifyView.vue'
@@ -63,6 +65,7 @@ const tabs = [
   { key: 'crisis', icon: '🛟', label: '危机处置' },
   { key: 'stmt', icon: '📢', label: '危机声明', badge: () => (store.stats.stmtReview || 0) + (store.stats.stmtChannelFailed || 0) },
   { key: 'work', icon: '📋', label: '协同工单', badge: () => store.stats.workOpen || 0 },
+  { key: 'rect', icon: '🧹', label: '整改跟进', badge: () => (store.stats.rectReviewing || 0) + (store.stats.rectPending || 0) },
   { key: 'report', icon: '📝', label: '复盘报告', badge: () => store.stats.reportReviewing || 0 },
   { key: 'ext', icon: '🤝', label: '外部协作', badge: () => store.stats.extPending || 0 },
   { key: 'portal', icon: '📮', label: '协作门户' },

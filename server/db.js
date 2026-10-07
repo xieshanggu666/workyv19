@@ -561,6 +561,66 @@ CREATE TABLE IF NOT EXISTS ext_submission_logs (
   time TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ext_logs_sub ON ext_submission_logs (submission_id, id);
+-- ===== 危机整改事项（外部协作方整改闭环：分派跟进 → 进度报送 → 验收/驳回 → 结案守卫） =====
+-- 整改事项主表：内部为危机建立整改项并分派给外部协作方，外部方在门户持续报送进度，值班员分派跟进，管理员验收/驳回
+CREATE TABLE IF NOT EXISTS rectifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE,            -- 整改事项编号 REC-XXXX
+  crisis_id INTEGER,                    -- 所属危机事件（整改项挂未结案事件；事件删除时解除引用保留留痕，故可空）
+  partner_id INTEGER,                   -- 分派的外部协作方（建档时可空=待分派，值班员分派后确定）
+  kind TEXT NOT NULL DEFAULT 'brand',   -- 冗余协作方类型（停用/改名后仍可溯）
+  work_order_id INTEGER,                -- 关联跟进协同工单（可空；进度/验收回写工单日志）
+  source_submission_id INTEGER,         -- 来源外部协作提交（可空；从门户材料采纳时一键建项）
+  title TEXT NOT NULL,                   -- 整改要求标题
+  requirement TEXT NOT NULL DEFAULT '', -- 整改要求/依据（监管要求、自查问题项）
+  priority TEXT NOT NULL DEFAULT 'high',-- urgent/high/normal
+  status TEXT NOT NULL DEFAULT 'pending', -- pending 待分派 / rectifying 整改中 / reviewing 待验收 / accepted 已通过 / rejected 已驳回 / cancelled 已取消
+  due_at INTEGER,                        -- 整改期限（毫秒时间戳，可空）
+  dispatched_by TEXT NOT NULL DEFAULT '',
+  dispatched_at TEXT,
+  submitted_by TEXT NOT NULL DEFAULT '', -- 最近一次提交验收的外部联系人
+  submitted_at TEXT,                     -- 最近一次提交验收时间
+  review_round INTEGER NOT NULL DEFAULT 0, -- 验收轮次（每次提交验收 +1，驳回后再提交递增；通知幂等与文案用）
+  verified_by TEXT NOT NULL DEFAULT '',  -- 验收管理员
+  verified_at TEXT,
+  verify_note TEXT NOT NULL DEFAULT '',  -- 验收意见 / 驳回原因（外部门户可见）
+  rejected_count INTEGER NOT NULL DEFAULT 0, -- 累计驳回次数
+  progress_count INTEGER NOT NULL DEFAULT 0, -- 累计进度报送条数
+  cancelled_by TEXT NOT NULL DEFAULT '',
+  cancelled_at TEXT,
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL DEFAULT '',
+  created TEXT NOT NULL,
+  updated TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rect_crisis ON rectifications (crisis_id, id);
+CREATE INDEX IF NOT EXISTS idx_rect_status ON rectifications (status, id);
+CREATE INDEX IF NOT EXISTS idx_rect_partner ON rectifications (partner_id, id);
+-- 整改进度报送：外部协作方多次报送，受理后自动进入待验收；全程留痕，验收通过/驳回均锚定到最近报送
+CREATE TABLE IF NOT EXISTS rect_progress (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  rect_id INTEGER NOT NULL,
+  partner_id INTEGER,                    -- 报送协作方（与事项分派方一致，冗余可溯）
+  content TEXT NOT NULL DEFAULT '',      -- 本期整改进展说明
+  attachments TEXT NOT NULL DEFAULT '[]',-- 附件清单 JSON：[{name,size,type}]（演示不落文件）
+  source_url TEXT NOT NULL DEFAULT '',   -- 佐证链接（整改公示页/检测报告页）
+  contact_info TEXT NOT NULL DEFAULT '', -- 报送联系人
+  submit_for_review INTEGER NOT NULL DEFAULT 0, -- 1=报送并申请验收（事项进入待验收）；0=过程进度
+  submitted_by TEXT NOT NULL DEFAULT '',
+  created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rect_progress_rect ON rect_progress (rect_id, id);
+-- 整改事项全程留痕：建档/分派/进度/报送验收/验收通过/驳回/取消（含操作人，区分内部/外部/系统）
+CREATE TABLE IF NOT EXISTS rect_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  rect_id INTEGER NOT NULL,
+  action TEXT NOT NULL,                  -- create/dispatch/progress/submit/verify/reject/cancel/system
+  detail TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '系统',
+  operator_side TEXT NOT NULL DEFAULT '',-- internal 内部 / external 外部 / system
+  time TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rect_logs_rect ON rect_logs (rect_id, id);
 -- 注：posts.idem_key 索引在下方 ensureColumn 之后创建（旧库可能尚无该列，此处创建会导致启动失败）
 `)
 
@@ -608,6 +668,39 @@ ensureColumn('notify_tasks', 'ext_submission_id', 'ext_submission_id INTEGER')
 ensureColumn('notify_subs', 'stmt_event', "stmt_event TEXT NOT NULL DEFAULT ''")
 ensureColumn('notify_tasks', 'statement_id', 'statement_id INTEGER')
 db.exec('CREATE INDEX IF NOT EXISTS idx_notify_tasks_stmt ON notify_tasks (statement_id, id);')
+// 危机整改事项扩展：通知订阅/任务支持整改事件（rect_event：progress 进度报送 / submitted 申请验收 / rejected 验收驳回 / accepted 验收通过 / assigned 分派跟进）
+ensureColumn('notify_subs', 'rect_event', "rect_event TEXT NOT NULL DEFAULT ''")
+ensureColumn('notify_tasks', 'rect_id', 'rect_id INTEGER')
+db.exec('CREATE INDEX IF NOT EXISTS idx_notify_tasks_rect ON notify_tasks (rect_id, id);')
+// 老库迁移：rectifications.crisis_id 需允许 NULL（删除危机时整改留痕保留、仅解除引用）。
+// SQLite 无法直接 ALTER 列约束，通过 sqlite_master 改写建表 SQL 后整库重建（同库临时 schema 变更）。
+function migrateRectCrisisNullable() {
+  const cols = db.prepare("PRAGMA table_info(rectifications)").all()
+  const col = cols.find((c) => c.name === 'crisis_id')
+  if (!col || col.notnull === 0) return
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='rectifications'").get().sql
+  if (!/crisis_id\s+INTEGER\s+NOT NULL/i.test(sql)) return
+  const newSql = sql.replace(/crisis_id\s+INTEGER\s+NOT NULL/i, 'crisis_id INTEGER')
+  db.exec('PRAGMA foreign_keys=OFF')
+  db.exec('BEGIN')
+  try {
+    db.exec(`ALTER TABLE rectifications RENAME TO rectifications_legacy`)
+    db.exec(newSql)
+    const names = cols.map((c) => c.name).join(',')
+    db.exec(`INSERT INTO rectifications (${names}) SELECT ${names} FROM rectifications_legacy`)
+    db.exec('DROP TABLE rectifications_legacy')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_rect_crisis ON rectifications (crisis_id, id)')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_rect_status ON rectifications (status, id)')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_rect_partner ON rectifications (partner_id, id)')
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  } finally {
+    db.exec('PRAGMA foreign_keys=ON')
+  }
+}
+migrateRectCrisisNullable()
 // 工单来源标记：传播路径爆发自动/手动生成的跨角色工单（自动工单去重与回写路径留痕用）
 ensureColumn('work_orders', 'prop_path_id', 'prop_path_id INTEGER')
 // 老库迁移：传播路径表爆发时间戳列（早期 TEXT 定义以建表语句为准，这里仅补缺失列）
@@ -748,6 +841,10 @@ function migrateOrphanNotifyTasks() {
   db.prepare(`UPDATE notify_tasks SET statement_id=(SELECT p.statement_id FROM notify_tasks p WHERE p.id=notify_tasks.escalated_from)
     WHERE escalated_from IS NOT NULL AND statement_id IS NULL
       AND EXISTS (SELECT 1 FROM notify_tasks p WHERE p.id=notify_tasks.escalated_from AND p.statement_id IS NOT NULL)`).run()
+  // 危机整改事项来源兜底（回执超时升级子任务继承 rect_id）
+  db.prepare(`UPDATE notify_tasks SET rect_id=(SELECT p.rect_id FROM notify_tasks p WHERE p.id=notify_tasks.escalated_from)
+    WHERE escalated_from IS NOT NULL AND rect_id IS NULL
+      AND EXISTS (SELECT 1 FROM notify_tasks p WHERE p.id=notify_tasks.escalated_from AND p.rect_id IS NOT NULL)`).run()
   const sweep = (where) => {
     const ids = db.prepare(`SELECT id FROM notify_tasks WHERE ${where}`).all().map((r) => r.id)
     if (!ids.length) return 0
@@ -765,6 +862,8 @@ function migrateOrphanNotifyTasks() {
   sweep("kind='ext' AND ext_submission_id IS NOT NULL AND ext_submission_id NOT IN (SELECT id FROM ext_submissions)")
   // ②d 来源悬空的危机声明任务（声明随危机删除后残留；含升级链后代在③循环兜底）
   sweep("kind='statement' AND statement_id IS NOT NULL AND statement_id NOT IN (SELECT id FROM crisis_statements)")
+  // ②e 来源悬空的危机整改任务（整改项随异常数据被物理删除等历史脏数据；整改项删除危机时保留仅解除引用）
+  sweep("kind='rect' AND rect_id IS NOT NULL AND rect_id NOT IN (SELECT id FROM rectifications)")
   // ③ 升级链孤儿（父任务已删除；链深 1，循环兜底历史异常数据）
   for (;;) {
     if (!sweep('escalated_from IS NOT NULL AND escalated_from NOT IN (SELECT id FROM notify_tasks)')) break
@@ -1473,3 +1572,88 @@ function seedExtPortal() {
   }
 }
 seedExtPortal()
+
+// 危机整改事项种子（独立幂等：老库升级后同样补齐整改项、进度报送与通知订阅）
+function seedRectifications() {
+  const now = new Date()
+  const ago = (m) => new Date(now.getTime() - m * 60000).toLocaleString('zh-CN')
+  const agoMs = (m) => now.getTime() - m * 60000
+  const c1 = db.prepare("SELECT id FROM crisis WHERE title LIKE '%门店卫生%' ORDER BY id LIMIT 1").get()
+  if (!c1) return
+  const brand = db.prepare("SELECT id FROM ext_partners WHERE access_code='BRAND-2026'").get()
+  if (!brand) return
+  const w2 = db.prepare("SELECT id FROM work_orders WHERE crisis_id=? AND title LIKE '%固定证据%' ORDER BY id LIMIT 1").get(c1.id)
+  const e2 = db.prepare("SELECT id FROM ext_submissions WHERE code='EXT-1002'").get()
+
+  const nr = db.prepare('SELECT COUNT(*) c FROM rectifications').get().c
+  if (nr === 0) {
+    const ri = db.prepare(`INSERT INTO rectifications
+      (code,crisis_id,partner_id,kind,work_order_id,source_submission_id,title,requirement,priority,status,due_at,
+       dispatched_by,dispatched_at,submitted_by,submitted_at,review_round,verified_by,verified_at,verify_note,
+       rejected_count,progress_count,created_by,created,updated)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    // R1 待验收：品牌方已完成两轮整改并申请验收（管理员可通过/驳回）
+    const r1 = Number(ri.run(
+      'REC-1001', c1.id, brand.id, 'brand', w2 ? w2.id : null, null,
+      '涉事加盟店后厨整改与第三方检测验收',
+      '1. 涉事门店停业整顿并完成后厨消杀、设备检修；\n2. 第三方检测机构进场采样，出具合格报告并向社会公示；\n3. 全国门店食品安全专项自查 100% 覆盖，提交整改清单与培训记录。',
+      'urgent', 'reviewing', agoMs(60),
+      '李澈', ago(300), '周敏', ago(20),
+      1, '', null, '', 0, 2, '张岚', ago(320), ago(20)).lastInsertRowid)
+    const pi = db.prepare(`INSERT INTO rect_progress
+      (rect_id,partner_id,content,attachments,source_url,contact_info,submit_for_review,submitted_by,created)
+      VALUES (?,?,?,?,?,?,?,?,?)`)
+    pi.run(r1, brand.id,
+      '第一日进展：涉事门店已停业整顿，后厨消杀与冷藏设备检修完成；第三方检测机构已进场采样；全国专项自查启动，覆盖率 42%。',
+      JSON.stringify([{ name: '门店消杀记录.pdf', size: 820000, type: 'application/pdf' }]),
+      'https://brand-demo.com/rectify/day1', '周敏 138-0000-1001', 0, '周敏', ago(180))
+    pi.run(r1, brand.id,
+      '第三日进展：第三方检测报告出具，食材与操作环境检测均合格，已在官网公示；全国门店专项自查覆盖率 100%，完成员工再培训 26 场，申请验收。',
+      JSON.stringify([{ name: '第三方检测报告.pdf', size: 1260000, type: 'application/pdf' }, { name: '自查整改清单.xlsx', size: 410000, type: 'application/vnd.ms-excel' }]),
+      'https://brand-demo.com/rectify/day3', '周敏 138-0000-1001', 1, '周敏', ago(20))
+    const li = db.prepare('INSERT INTO rect_logs (rect_id,action,detail,operator,operator_side,time) VALUES (?,?,?,?,?,?)')
+    li.run(r1, 'create', `管理员为危机 #${c1.id} 建立整改事项「涉事加盟店后厨整改与第三方检测验收」（紧急）`, '张岚', 'internal', ago(320))
+    li.run(r1, 'dispatch', `值班员 李澈 分派给品牌方（某连锁品牌总部·周敏），整改期限 ${ago(60)}` + (w2 ? '，关联跟进工单' : ''), '李澈', 'internal', ago(300))
+    if (w2) {
+      db.prepare('INSERT INTO work_order_logs (wo_id,action,detail,operator,operator_role,time) VALUES (?,?,?,?,?,?)')
+        .run(w2.id, 'rect', '危机整改事项 REC-1001 分派给品牌方跟进：涉事加盟店后厨整改与第三方检测验收（整改期限 ' + ago(60) + '）', '李澈', 'ops', ago(300))
+    }
+    db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time,ref_type,ref_id) VALUES (?,?,?,?,?,?)')
+      .run(c1.id, '整改事项建档', '建立整改事项「涉事加盟店后厨整改与第三方检测验收」并分派品牌方跟进（REC-1001）', ago(300), 'rect', r1)
+    li.run(r1, 'progress', '品牌方报送第 1 期整改进度（过程报送，不申请验收）：停业整顿与消杀完成、第三方进场、自查覆盖 42%', '周敏', 'external', ago(180))
+    db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time,ref_type,ref_id) VALUES (?,?,?,?,?,?)')
+      .run(c1.id, '整改进度', '品牌方报送整改事项 REC-1001 第 1 期进度：停业整顿与消杀完成、第三方进场采样、自查覆盖 42%', ago(180), 'rect', r1)
+    li.run(r1, 'submit', '品牌方报送第 2 期进度并申请验收（第 1 轮）：检测合格公示、自查 100% 覆盖、培训 26 场', '周敏', 'external', ago(20))
+    db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time,ref_type,ref_id) VALUES (?,?,?,?,?,?)')
+      .run(c1.id, '整改报送验收', '整改事项 REC-1001 已由品牌方报送验收（第 1 轮）：第三方检测合格公示、全国自查 100% 覆盖，等待管理员验收', ago(20), 'rect', r1)
+
+    // R2 待分派：依据监管督办新建，尚未分派（演示分派闭环）
+    const r2 = Number(ri.run(
+      'REC-1002', c1.id, null, 'regulator', null, e2 ? e2.id : null,
+      '监管限期整改：加盟店食安管理制度排查与整改清单报送',
+      '依据市场监管部门督办通知：48 小时内提交书面整改情况说明；对全国加盟店食品安全管理制度开展排查，逐项报送整改清单与责任人。',
+      'urgent', 'pending', agoMs(60 * 24),
+      '', null, '', null,
+      0, '', null, '', 0, 0, '张岚', ago(10), ago(10)).lastInsertRowid)
+    li.run(r2, 'create', '管理员依据监管督办（EXT-1002）建立整改事项「监管限期整改：加盟店食安管理制度排查与整改清单报送」（紧急，待分派）', '张岚', 'internal', ago(10))
+    db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time,ref_type,ref_id) VALUES (?,?,?,?,?,?)')
+      .run(c1.id, '整改事项建档', '依据监管督办建立整改事项「监管限期整改：加盟店食安管理制度排查与整改清单报送」（REC-1002，待分派）', ago(10), 'rect', r2)
+  }
+
+  // 通知订阅（独立幂等：整改项已存在时也补齐订阅；任务由启动流程补生成）
+  const nsub = db.prepare("SELECT COUNT(*) c FROM notify_subs WHERE rect_event!=''").get().c
+  if (nsub === 0) {
+    const nowStr = now.toLocaleString('zh-CN')
+    const ch1 = db.prepare("SELECT id FROM notify_channels WHERE name='值班 Webhook'").get()
+    const ch2 = db.prepare("SELECT id FROM notify_channels WHERE name='危机邮箱组'").get()
+    const ch4 = db.prepare("SELECT id FROM notify_channels WHERE name='升级专线'").get()
+    const es = db.prepare(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,active,created,created_by,rect_event)
+      VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?)`)
+    if (ch1) es.run('整改事项分派跟进通知', null, '', '', '', JSON.stringify([ch1.id]), 0, 30, null, 3, nowStr, '系统初始化', 'assigned')
+    if (ch1) es.run('整改进度报送提醒', null, '', '', '', JSON.stringify([ch1.id]), 0, 30, null, 3, nowStr, '系统初始化', 'progress')
+    if (ch1 && ch2) es.run('整改申请验收待办提醒', null, '', '', '', JSON.stringify([ch1.id, ch2.id]), 0, 30, null, 3, nowStr, '系统初始化', 'submitted')
+    if (ch1) es.run('整改验收驳回通知', null, '', '', '', JSON.stringify([ch1.id]), 0, 30, null, 3, nowStr, '系统初始化', 'rejected')
+    if (ch4) es.run('整改验收通过通报', null, '', '', '', JSON.stringify([ch4.id]), 0, 30, null, 3, nowStr, '系统初始化', 'accepted')
+  }
+}
+seedRectifications()

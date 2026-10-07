@@ -25,7 +25,7 @@ import {
   blockWorkOrder, completeWorkOrder, reworkWorkOrder, cancelWorkOrder,
   startWorkOrderScheduler, bindWorkOrderNotify
 } from './workorders.js'
-import { generateForWorkOrder, generateForPropEvent, seedPropNotifyTasks, generateForExtSubmission, seedExtNotifyTasks, seedStatementNotifyTasks } from './notify.js'
+import { generateForWorkOrder, generateForPropEvent, seedPropNotifyTasks, generateForExtSubmission, seedExtNotifyTasks, seedStatementNotifyTasks, generateForRectification, seedRectNotifyTasks } from './notify.js'
 import { crisisDispatchRollup } from './dispatch.js'
 import { bindPipelineProp } from './pipeline.js'
 import {
@@ -56,6 +56,14 @@ import {
   receiveSubmission, acceptSubmission, rejectSubmission, bindSubmissionCrisis,
   detachSubmissionsOfCrisis, healSubmissionCrisisLinks
 } from './portal.js'
+import {
+  RECT_STATUS, RECT_PRIORITY,
+  listRectifications, getRectification, rectSummary, crisisRectBrief, partnerRectBrief,
+  listPartnerRectifications, getRectificationForPartner,
+  createRectification, dispatchRectification, openFollowWorkOrder,
+  submitRectProgress, verifyRectification, rejectRectification, cancelRectification,
+  detachRectificationsOfCrisis, bindRectNotify
+} from './rectifications.js'
 import { closureReadiness, closeCrisis, reopenCrisis } from './closures.js'
 
 const app = express()
@@ -113,6 +121,10 @@ if (seededExt) console.log(`[PORTAL] 为存量紧急外部提交生成 ${seededE
 // 危机声明：为存量「部分渠道失败」声明补生成督办通知（幂等），失败渠道重试/超时升级复用通知调度
 const seededStmt = seedStatementNotifyTasks()
 if (seededStmt) console.log(`[STMT] 为存量部分渠道失败声明生成 ${seededStmt} 个督办通知`)
+// 危机整改事项：注入通知联动钩子（分派/进度/申请验收/驳回/通过 → 复用通知编排），并为存量待办补生成通知（幂等）
+bindRectNotify({ notifyOnRectEvent: (id, event, extra) => generateForRectification(id, event, extra) })
+const seededRect = seedRectNotifyTasks()
+if (seededRect) console.log(`[RECT] 为存量待办整改事项生成 ${seededRect} 个通知`)
 
 // 危机列表（含来源规则、承接规则、未解除预警数、协同工单统计、时间线）
 function crisisList(withTimeline = false) {
@@ -127,8 +139,13 @@ function crisisList(withTimeline = false) {
     (SELECT COUNT(*) FROM crisis_statement_channels sc JOIN crisis_statements st ON st.id=sc.statement_id
       WHERE st.crisis_id=c.id AND sc.status IN ('pending','publishing')) stmt_ch_open,
     (SELECT COUNT(*) FROM crisis_statement_channels sc JOIN crisis_statements st ON st.id=sc.statement_id
-      WHERE st.crisis_id=c.id AND sc.status='success') stmt_ch_ok
-    FROM crisis c LEFT JOIN alerts a ON a.id=c.alert_id ORDER BY c.id DESC`)
+      WHERE st.crisis_id=c.id AND sc.status='success') stmt_ch_ok,
+    (SELECT COUNT(*) FROM rectifications rc WHERE rc.crisis_id=c.id AND rc.status IN ('pending','rectifying','reviewing','rejected')) rect_open,
+    (SELECT COUNT(*) FROM rectifications rc WHERE rc.crisis_id=c.id AND rc.status='reviewing') rect_review,
+    (SELECT COUNT(*) FROM rectifications rc WHERE rc.crisis_id=c.id AND rc.status='accepted') rect_accepted,
+    (SELECT COUNT(*) FROM rectifications rc WHERE rc.crisis_id=c.id AND rc.status IN ('pending','rectifying','reviewing','rejected')
+      AND rc.due_at IS NOT NULL AND rc.due_at<?) rect_overdue
+    FROM crisis c LEFT JOIN alerts a ON a.id=c.alert_id ORDER BY c.id DESC`, Date.now())
   // 调度链路批量汇总（通知发送/回执/升级 + 工单超时/升级，与工单看板、复盘快照同口径）
   const dispatchMap = crisisDispatchRollup(list.map((c) => c.id))
   return list.map((c) => {
@@ -139,6 +156,7 @@ function crisisList(withTimeline = false) {
     item.report = crisisReportBrief(c.id) // 复盘报告状态（编制中/待审核/已发布 + 当前版本）
     item.statement = crisisStatementBrief(c.id) // 最新危机声明状态（危机卡片角标）
     item.extPortal = crisisSubmissionBrief(c.id) // 外部协作门户待审核提交（含紧急数）
+    item.rectification = crisisRectBrief(c.id) // 危机整改事项（未办结/待验收/已通过/逾期）
     if (withTimeline) item.timeline = q('SELECT * FROM crisis_timeline WHERE crisis_id=? ORDER BY id DESC', c.id)
     return item
   })
@@ -180,7 +198,13 @@ app.get('/api/state', (req, res) => {
     (SELECT COUNT(*) FROM ext_submissions WHERE status='pending') extPending,
     (SELECT COUNT(*) FROM ext_submissions WHERE status='reviewing') extReviewing,
     (SELECT COUNT(*) FROM ext_submissions WHERE is_urgent=1 AND status IN ('pending','reviewing')) extUrgentOpen,
-    (SELECT COUNT(*) FROM ext_submissions WHERE status='accepted') extAccepted`, Date.now())
+    (SELECT COUNT(*) FROM ext_submissions WHERE status='accepted') extAccepted,
+    (SELECT COUNT(*) FROM rectifications WHERE status='pending') rectPending,
+    (SELECT COUNT(*) FROM rectifications WHERE status IN ('rectifying','rejected')) rectRectifying,
+    (SELECT COUNT(*) FROM rectifications WHERE status='reviewing') rectReviewing,
+    (SELECT COUNT(*) FROM rectifications WHERE status='accepted') rectAccepted,
+    (SELECT COUNT(*) FROM rectifications WHERE status IN ('pending','rectifying','reviewing','rejected')
+      AND due_at IS NOT NULL AND due_at<?) rectOverdue`, Date.now())
   // 热度趋势（近7时段）
   const nowH = new Date().getHours()
   const trend = []
@@ -576,6 +600,8 @@ app.delete('/api/crisis/:id', (req, res) => {
     deleteStatementsOfCrisis(cid)
     // 外部协作提交保留（外部方提交的证据/进度是跨主体留痕），仅解除危机与工单引用
     detachSubmissionsOfCrisis(cid)
+    // 危机整改事项保留（跨主体整改闭环留痕，含外部方报送进度），仅解除危机引用；通知任务随 notify 级联口径保留/解绑
+    detachRectificationsOfCrisis(cid)
     // 传播路径保留（沉淀的来源/节点/转发关系不随事件删除），仅解除危机引用
     run('UPDATE prop_paths SET crisis_id=NULL WHERE crisis_id=?', cid)
     run('DELETE FROM crisis WHERE id=?', cid)
@@ -774,13 +800,13 @@ app.post('/api/notify/subs', guard('admin'), (req, res) => {
   const err = validateSub(req.body)
   if (err) return res.status(400).json({ error: err })
   const b = req.body
-  run(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,wo_event,prop_event,ext_event,stmt_event,active,created,created_by)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+  run(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,wo_event,prop_event,ext_event,stmt_event,rect_event,active,created,created_by)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
     b.name.trim(), b.alert_id ? +b.alert_id : null, (b.topic || '').trim(), String(b.crisis_status || ''),
     (Array.isArray(b.levels) ? b.levels : []).filter((x) => ['red', 'orange', 'yellow'].includes(x)).join(','),
     JSON.stringify(b.channel_ids.map(Number)), b.require_ack ? 1 : 0,
     Math.max(1, +b.ack_timeout_min || 30), b.escalate_channel_id ? +b.escalate_channel_id : null,
-    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), String(b.prop_event || ''), String(b.ext_event || ''), String(b.stmt_event || ''), now(), req.actor.user)
+    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), String(b.prop_event || ''), String(b.ext_event || ''), String(b.stmt_event || ''), String(b.rect_event || ''), now(), req.actor.user)
   res.json({ ok: true })
 })
 app.put('/api/notify/subs/:id', guard('admin'), (req, res) => {
@@ -789,12 +815,12 @@ app.put('/api/notify/subs/:id', guard('admin'), (req, res) => {
   const err = validateSub(req.body)
   if (err) return res.status(400).json({ error: err })
   const b = req.body
-  run(`UPDATE notify_subs SET name=?,alert_id=?,topic=?,crisis_status=?,levels=?,channel_ids=?,require_ack=?,ack_timeout_min=?,escalate_channel_id=?,max_retry=?,wo_event=?,prop_event=?,ext_event=?,stmt_event=? WHERE id=?`,
+  run(`UPDATE notify_subs SET name=?,alert_id=?,topic=?,crisis_status=?,levels=?,channel_ids=?,require_ack=?,ack_timeout_min=?,escalate_channel_id=?,max_retry=?,wo_event=?,prop_event=?,ext_event=?,stmt_event=?,rect_event=? WHERE id=?`,
     b.name.trim(), b.alert_id ? +b.alert_id : null, (b.topic || '').trim(), String(b.crisis_status || ''),
     (Array.isArray(b.levels) ? b.levels : []).filter((x) => ['red', 'orange', 'yellow'].includes(x)).join(','),
     JSON.stringify(b.channel_ids.map(Number)), b.require_ack ? 1 : 0,
     Math.max(1, +b.ack_timeout_min || 30), b.escalate_channel_id ? +b.escalate_channel_id : null,
-    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), String(b.prop_event || ''), String(b.ext_event || ''), String(b.stmt_event || ''), s.id)
+    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), String(b.prop_event || ''), String(b.ext_event || ''), String(b.stmt_event || ''), String(b.rect_event || ''), s.id)
   res.json({ ok: true })
 })
 app.post('/api/notify/subs/:id/toggle', guard('admin'), (req, res) => {
@@ -1122,7 +1148,12 @@ app.post('/api/statement-channels/:chId/cancel', guard('ops'), stmtChannelAction
 app.get('/api/portal/bootstrap', (req, res) => {
   const partner = partnerOf(req)
   if (!partner) return res.status(401).json({ error: '门户口令无效或协作方已停用，请在门户页选择协作方身份' })
-  res.json(portalBootstrap(partner))
+  const data = portalBootstrap(partner)
+  // 合并协作方本人的整改事项（与历史提交并列；历史反馈查看与处理不受影响）
+  data.rectifications = listPartnerRectifications(partner.id)
+  data.rectBrief = partnerRectBrief(partner.id)
+  data.rectDict = { status: RECT_STATUS, priority: RECT_PRIORITY }
+  res.json(data)
 })
 // 提交证据/整改进度（关联未结案危机；紧急提交联动通知升级）
 app.post('/api/portal/submissions', (req, res) => {
@@ -1225,6 +1256,97 @@ app.post('/api/ext-submissions/:id/crisis', guard('ops'), (req, res) => {
   if (!r) return res.status(404).json({ error: '外部提交不存在' })
   if (r.error) return res.status(400).json({ error: r.error })
   res.json(r)
+})
+
+// ===== 危机整改事项（外部协作方整改闭环：分派跟进 → 进度报送 → 验收/驳回 → 结案守卫） =====
+// 内部接口：viewer 只读 / ops 建档·分派跟进·取消 / admin 独占验收通过与驳回
+// 内部看板（状态/危机/协作方类型过滤 + 汇总 + 字典）
+app.get('/api/rectifications', (req, res) => {
+  res.json({
+    items: listRectifications({
+      status: String(req.query.status || ''),
+      crisisId: req.query.crisis_id ? +req.query.crisis_id : null,
+      kind: String(req.query.kind || ''),
+      partnerId: req.query.partner_id ? +req.query.partner_id : null
+    }),
+    summary: rectSummary(),
+    dict: { status: RECT_STATUS, priority: RECT_PRIORITY, kind: PARTNER_KIND },
+    actor: actorOf(req)
+  })
+})
+app.get('/api/rectifications/:id', (req, res) => {
+  const r = getRectification(+req.params.id)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
+  res.json({ rectification: r })
+})
+// 建档（ops+；必须挂未结案危机，可直接分派协作方、关联跟进工单与来源外部提交）
+app.post('/api/rectifications', guard('ops'), (req, res) => {
+  const r = createRectification(req.body, req.actor)
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.status(201).json(r)
+})
+// 分派/改派协作方跟进（ops+）
+app.post('/api/rectifications/:id/dispatch', guard('ops'), (req, res) => {
+  const r = dispatchRectification(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+// 拆分跟进协同工单并挂接（ops+）
+app.post('/api/rectifications/:id/work-order', guard('ops'), (req, res) => {
+  const r = openFollowWorkOrder(+req.params.id, req.body, req.actor, createWorkOrder)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+// 取消整改事项（ops+；已验收通过不可取消）
+app.post('/api/rectifications/:id/cancel', guard('ops'), (req, res) => {
+  const r = cancelRectification(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+// 管理员验收通过（仅 admin；可联动解除该事件全部未解除预警）
+app.post('/api/rectifications/:id/verify', guard('admin'), (req, res) => {
+  const r = verifyRectification(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+// 管理员验收驳回（仅 admin；驳回原因外部门户可见）
+app.post('/api/rectifications/:id/reject', guard('admin'), (req, res) => {
+  const r = rejectRectification(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+
+// ---------- 外部门户（口令鉴权）：协作方查看分派给本方的整改事项并报送进度 ----------
+// 门户首页额外返回协作方本人的整改事项与待办速览（与本人历史提交相互独立，历史反馈仍可查看处理）
+app.get('/api/portal/rectifications', (req, res) => {
+  const partner = partnerOf(req)
+  if (!partner) return res.status(401).json({ error: '门户口令无效或协作方已停用' })
+  res.json({
+    items: listPartnerRectifications(partner.id),
+    brief: partnerRectBrief(partner.id),
+    dict: { status: RECT_STATUS, priority: RECT_PRIORITY }
+  })
+})
+app.get('/api/portal/rectifications/:id', (req, res) => {
+  const partner = partnerOf(req)
+  if (!partner) return res.status(401).json({ error: '门户口令无效或协作方已停用' })
+  const r = getRectificationForPartner(+req.params.id, partner.id)
+  if (!r) return res.status(404).json({ error: '整改事项不存在或无权查看' })
+  res.json({ rectification: r })
+})
+// 报送整改进度（submit_for_review=1 同时申请验收，事项进入待验收等待管理员处理）
+app.post('/api/portal/rectifications/:id/progress', (req, res) => {
+  const partner = partnerOf(req)
+  if (!partner) return res.status(401).json({ error: '门户口令无效或协作方已停用' })
+  const r = submitRectProgress(+req.params.id, req.body, partner)
+  if (!r) return res.status(404).json({ error: '整改事项不存在或无权操作' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.status(201).json(r)
 })
 
 const PORT = Number(process.env.PORT) || 4130

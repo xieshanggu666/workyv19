@@ -36,8 +36,19 @@ export function closureReadiness(crisisId) {
   const degradedStatements = q(
     "SELECT id,title,status,degraded_mode,degraded_by,degrade_reason FROM crisis_statements WHERE crisis_id=? AND status='degraded' ORDER BY id",
     crisisId)
+  // 已验收通过的整改事项为办结终态（不阻断结案），仅用于守卫清单提示与快照冻结
+  const acceptedRectifications = q(
+    "SELECT id,code,title,status FROM rectifications WHERE crisis_id=? AND status='accepted' ORDER BY id",
+    crisisId)
   const openSubmissions = q(
     "SELECT id,code,title,status,is_urgent,kind FROM ext_submissions WHERE crisis_id=? AND status IN ('pending','reviewing') ORDER BY is_urgent DESC, id",
+    crisisId)
+  // 未办结危机整改事项（待分派/整改中/待验收/已驳回）阻断结案；已通过/已取消不阻断
+  const openRectifications = q(
+    `SELECT id,code,title,status,priority,partner_id,due_at,
+      (SELECT name FROM ext_partners WHERE id=rectifications.partner_id) partner_name
+     FROM rectifications WHERE crisis_id=? AND status IN ('pending','rectifying','reviewing','rejected')
+     ORDER BY (status='reviewing') DESC, due_at IS NULL, due_at, id`,
     crisisId)
   const openAlerts = q("SELECT id,alert_id FROM alert_events WHERE crisis_id=? AND status='open'", crisisId)
   const inflightTasks = q(
@@ -52,6 +63,7 @@ export function closureReadiness(crisisId) {
   if (openWorkOrders.length) blockers.push({ key: 'workorder', label: '未完结协同工单', count: openWorkOrders.length })
   if (openStatements.length) blockers.push({ key: 'statement', label: '未完结危机声明', count: openStatements.length })
   if (openSubmissions.length) blockers.push({ key: 'external', label: '待审核外部协作提交', count: openSubmissions.length })
+  if (openRectifications.length) blockers.push({ key: 'rectification', label: '未办结危机整改事项', count: openRectifications.length })
   if (!report || report.status !== 'published') blockers.push({ key: 'report', label: '复盘报告未发布', count: 1 })
 
   return {
@@ -62,7 +74,9 @@ export function closureReadiness(crisisId) {
     workOrders: openWorkOrders,
     statements: openStatements,
     degradedStatements,
+    acceptedRectifications,
     submissions: openSubmissions,
+    rectifications: openRectifications,
     openAlerts,
     inflightTasks,
     report: report
@@ -79,6 +93,7 @@ export function blockerError(rd) {
     if (b.key === 'workorder') return `${b.count} 个未完结协同工单（待分派/处理中/已阻塞，请先完成或取消）`
     if (b.key === 'statement') return `${b.count} 份未完结危机声明（起草/待审/发布中/部分渠道失败，请先完成发布或取消）`
     if (b.key === 'external') return `${b.count} 条待审核外部协作提交（待审核/受理中，请先受理后采纳、驳回或由提交方撤回）`
+    if (b.key === 'rectification') return `${b.count} 项未办结危机整改事项（待分派/整改中/待验收/已驳回，请先分派跟进、完成整改并由管理员验收通过，或取消）`
     return '复盘报告尚未审核发布（请完成跨角色编制并由管理员审核通过后再结案）'
   })
   return '结案统一守卫未通过：' + parts.join('；')
@@ -120,12 +135,14 @@ export function closeCrisis(crisisId, rawSummary = '') {
   }))
   // 守卫快照（冻结结案时点的全量口径，回溯面板展示，与历史空快照档案区分）
   const degradedStmtCount = q1("SELECT COUNT(*) c FROM crisis_statements WHERE crisis_id=? AND status='degraded'", crisisId).c
+  const acceptedRectCount = q1("SELECT COUNT(*) c FROM rectifications WHERE crisis_id=? AND status='accepted'", crisisId).c
   const guardSnapshot = {
     closedAt: ts,
     prevStatus: c.status,
     workOrders: { open: rd.workOrders.length },
     statements: { open: rd.statements.length, degraded: degradedStmtCount },
     submissions: { open: rd.submissions.length },
+    rectifications: { open: rd.rectifications.length, accepted: acceptedRectCount },
     alerts: { open: opens.length, resolved: opens.length },
     notifyTasks: { inflight: tasks.length, cancelled: tasks.length },
     report: rd.report ? { id: rd.report.id, title: rd.report.title, version: rd.report.publishedVersion || rd.report.version } : null
@@ -164,6 +181,7 @@ export function closeCrisis(crisisId, rawSummary = '') {
     if (opens.length) bits.push(`同步解除 ${opens.length} 条未解除预警${ruleNames.length ? '：' + ruleNames.join('、') : ''}`)
     if (tasks.length) bits.push(`联动中止 ${tasks.length} 条在途通知任务（回滚结案可恢复）`)
     if (degradedStmtCount) bits.push(`${degradedStmtCount} 份声明为降级发布（失败渠道已按策略降级终止并保留记录，不阻断结案）`)
+    if (acceptedRectCount) bits.push(`${acceptedRectCount} 项整改事项已验收通过`)
     if (rd.report) bits.push(`复盘报告「${rd.report.title}」已发布（v${rd.report.publishedVersion || rd.report.version}）`)
     addTimeline(crisisId, '事件结案', bits.join('（'), ts)
     db.exec('COMMIT')

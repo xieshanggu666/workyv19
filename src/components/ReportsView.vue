@@ -202,6 +202,29 @@
               </div>
             </section>
 
+            <!-- 危机整改事项（外部协作方整改闭环：分派→进度报送→验收/驳回） -->
+            <section class="snap-sec">
+              <h5>🧹 危机整改事项（{{ (snap.rectifications && snap.rectifications.total) || 0 }} 项 · 已通过 {{ (snap.rectifications && snap.rectifications.accepted) || 0 }} · 待验收 {{ (snap.rectifications && snap.rectifications.reviewing) || 0 }}<template v-if="snap.rectifications && snap.rectifications.overdue"> · 逾期 {{ snap.rectifications.overdue }}</template><template v-if="snap.rectifications && snap.rectifications.progressCount"> · 进度报送 {{ snap.rectifications.progressCount }} 期</template>）</h5>
+              <div v-if="!snap.rectifications || !snap.rectifications.total" class="snap-empty">该事件暂无整改事项</div>
+              <div v-for="rc in (snap.rectifications && snap.rectifications.items) || []" :key="rc.id" class="rect-snap" :class="rc.status">
+                <div class="rect-snap-head">
+                  <span class="code">{{ rc.code }}</span>
+                  <span class="tag" :class="'rectst-'+rc.status">{{ rectStatusText(rc.status) }}</span>
+                  <span v-if="rc.overdue" class="rect-overdue">⏰ 已逾期</span>
+                  <b>{{ rc.title }}</b>
+                  <span class="rect-who">{{ extKindText(rc.kind) }} · {{ rc.partner_name || '待分派' }}</span>
+                </div>
+                <div class="rect-snap-meta">
+                  {{ rc.priority === 'urgent' ? '紧急' : rc.priority === 'high' ? '高优' : '普通' }}<template v-if="rc.work_order_id"> · 📋 跟进工单 #{{ rc.work_order_id }}</template>
+                  · 进度 {{ rc.progress_count }} 期<template v-if="rc.rejected_count"> · 驳回 {{ rc.rejected_count }} 次</template><template v-if="rc.due_at"> · 期限 {{ fmtTs(rc.due_at) }}</template>
+                </div>
+                <span v-if="rc.latestProgress" class="rect-last">📈 最近报送：{{ rc.latestProgress.content.slice(0,120) }}（{{ rc.latestProgress.created }}）</span>
+                <span v-if="rc.status==='accepted'" class="rect-note">✔ {{ rc.verified_by }} 验收通过（{{ rc.verified_at }}）<template v-if="rc.verify_note">：{{ rc.verify_note }}</template></span>
+                <span v-else-if="rc.status==='rejected'" class="rect-note reject">↩ {{ rc.verified_by }} 驳回：{{ rc.verify_note }}</span>
+                <span v-else-if="rc.status==='cancelled'" class="rect-note cancel">✕ 已取消<template v-if="rc.cancel_reason">：{{ rc.cancel_reason }}</template></span>
+              </div>
+            </section>
+
             <!-- 通知回执（与危机看板/工单调度链路同口径） -->
             <section class="snap-sec">
               <h5>🔔 通知与回执（{{ snap.notifications.total }} 条 · 已回执 {{ snap.notifications.acked }} · 已升级 {{ snap.notifications.escalated }}<template v-if="snap.notifications.retries"> · 自动重试 {{ snap.notifications.retries }}</template>）</h5>
@@ -213,7 +236,7 @@
                 <div v-for="t in snap.notifications.items" :key="t.id" class="snap-item nt">
                   <span class="nt-dot" :class="t.status"></span>
                   <b>{{ t.title }}</b>
-                  <span>{{ t.channel_name }}（{{ t.channel_type }}）<template v-if="t.work_order_id"> · 📋 工单 #{{ t.work_order_id }}</template><template v-if="t.prop_path_id"> · 🕸 传播路径 #{{ t.prop_path_id }}</template><template v-if="t.ext_submission_id"> · 🤝 外部协作 #{{ t.ext_submission_id }}</template><template v-if="t.attempts>1"> · 尝试 {{ t.attempts }}/{{ t.max_attempts }}</template></span>
+                  <span>{{ t.channel_name }}（{{ t.channel_type }}）<template v-if="t.work_order_id"> · 📋 工单 #{{ t.work_order_id }}</template><template v-if="t.prop_path_id"> · 🕸 传播路径 #{{ t.prop_path_id }}</template><template v-if="t.ext_submission_id"> · 🤝 外部协作 #{{ t.ext_submission_id }}</template><template v-if="t.rect_id"> · 🧹 整改事项 #{{ t.rect_id }}</template><template v-if="t.attempts>1"> · 尝试 {{ t.attempts }}/{{ t.max_attempts }}</template></span>
                   <i class="tag" :class="'st-'+t.status">{{ ntText(t.status) }}</i>
                   <span v-if="t.escalated_from" class="ack">⬆ 回执超时升级自 #{{ t.escalated_from }}</span>
                   <span v-if="t.ack_by" class="ack">回执：{{ t.ack_by }} · {{ t.ack_at }}<template v-if="t.ack_note">（{{ t.ack_note }}）</template></span>
@@ -323,6 +346,8 @@ function stmtChText(x) { return { pending: '待执行', publishing: '执行中',
 function extStatusText(x) { return { pending: '待审核', reviewing: '受理中', accepted: '已采纳', rejected: '已驳回', withdrawn: '已撤回' }[x] || x }
 function extKindText(x) { return { brand: '品牌方', regulator: '监管方', media: '媒体' }[x] || x }
 function extDocText(x) { return { evidence: '证据材料', rectify: '整改进度', clue: '线索反映' }[x] || x }
+function rectStatusText(x) { return { pending: '待分派', rectifying: '整改中', reviewing: '待验收', accepted: '已通过', rejected: '已驳回', cancelled: '已取消' }[x] || x }
+function fmtTs(ms) { return ms ? new Date(ms).toLocaleString('zh-CN') : '—' }
 function formatNum(n) { return n >= 10000 ? (n / 10000).toFixed(1) + ' 万' : String(n || 0) }
 function hasReport(crisisId) { return items.value.some((r) => r.crisis_id === crisisId) }
 
@@ -562,6 +587,28 @@ input,select,textarea,button{font-family:inherit;}
 .ext-who{color:#aebadd;}
 .ext-snap-meta{font-size:10px;color:#8ba2c8;}
 .ext-note{font-size:10px;color:#a5d6a7;}.ext-note.reject{color:#ce93d8;}
+.rect-snap{background:#0c1a30;border:1px solid rgba(38,166,154,.22);border-left:3px solid #26a69a;border-radius:7px;padding:8px 11px;margin-bottom:6px;display:flex;flex-direction:column;gap:5px;}
+.rect-snap.accepted{border-left-color:#66bb6a;}
+.rect-snap.reviewing{border-left-color:#ab47bc;}
+.rect-snap.rejected{border-left-color:#8d6e63;}
+.rect-snap.pending{border-left-color:#ef5350;}
+.rect-snap.cancelled{border-left-color:#616161;opacity:.8;}
+.rect-snap-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px;color:#8ba2c8;}
+.rect-snap-head b{color:#dbe4f3;}
+.rect-snap-head .code{font-family:monospace;color:#80cbc4;background:#0a2622;border-radius:5px;padding:0 6px;}
+.rect-overdue{color:#fff;background:#c62828;border-radius:8px;padding:0 7px;font-weight:700;}
+.rect-who{color:#aebadd;}
+.rect-snap-meta{font-size:10px;color:#8ba2c8;}
+.rect-last{font-size:10px;color:#c6d3ea;line-height:1.6;white-space:pre-wrap;}
+.rect-note{font-size:10px;color:#a5d6a7;}
+.rect-note.reject{color:#bcaaa4;}
+.rect-note.cancel{color:#90a4ae;}
+.tag.rectst-pending{background:#3e2723;color:#ff8a80;}
+.tag.rectst-rectifying{background:#3e2f0a;color:#ffe082;}
+.tag.rectst-reviewing{background:#3d1a4d;color:#ce93d8;}
+.tag.rectst-accepted{background:#143d1c;color:#a5d6a7;}
+.tag.rectst-rejected{background:#3e2723;color:#bcaaa4;}
+.tag.rectst-cancelled{background:#263238;color:#90a4ae;}
 .st-todo{background:#37474f;color:#cfd8dc;}.st-doing{background:#0d47a1;color:#bbdefb;}.st-blocked{background:#4e342e;color:#ffcc80;}
 .st-done{background:#1b5e20;color:#a5d6a7;}.st-cancelled{background:#263238;color:#90a4ae;}
 .nt-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px;}

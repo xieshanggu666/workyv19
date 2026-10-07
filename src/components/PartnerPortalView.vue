@@ -36,6 +36,95 @@
 
       <p class="hint">📌 提交后状态流转：<b>待审核 → 受理中 → 已采纳 / 已驳回</b>；已采纳材料将并入危机处置档案，可在下方查看内部审核意见；被驳回时可补充材料后重新提交。</p>
 
+      <!-- ===== 分派给本协作方的危机整改事项（报送整改进度 / 申请验收） ===== -->
+      <section v-if="rects.length" class="rect-block">
+        <h3>🧹 分派给本机构的危机整改事项
+          <span class="rect-brief">
+            <i v-if="rectBrief.rectifying" class="b-wait">整改中 {{ rectBrief.rectifying }}</i>
+            <i v-if="rectBrief.reviewing" class="b-rev">待验收 {{ rectBrief.reviewing }}</i>
+            <i v-if="rectBrief.accepted" class="b-ok">已通过 {{ rectBrief.accepted }}</i>
+          </span>
+        </h3>
+        <p class="rect-hint">按整改要求持续报送进度；全部完成后<b>申请验收</b>，由内部管理员验收通过或驳回（驳回原因在此可见，可补充进度后再次申请）。整改进度将同步内部跟进工单与危机时间线。</p>
+        <div class="rect-list">
+          <div v-for="r in rects" :key="r.id" class="rect-card" :class="[r.status,{overdue:r.overdue}]">
+            <div class="rc-head">
+              <span class="code">{{ r.code }}</span>
+              <span class="rc-st" :class="r.status">{{ r.statusText }}</span>
+              <span class="rc-prio" :class="r.priority">{{ prioText(r.priority) }}</span>
+              <span v-if="r.overdue" class="rc-overdue">⏰ 已超过整改期限</span>
+              <b class="rc-title">{{ r.title }}</b>
+            </div>
+            <div class="rc-meta">
+              <span v-if="r.crisis_id">关联事件 <i>#{{ r.crisis_id }} {{ r.crisis_title }}</i></span>
+              <span v-else class="rc-detached">关联事件已删除（整改留痕保留）</span>
+              <span v-if="r.due_at" class="due">整改期限 {{ fmtTs(r.due_at) }}</span>
+              <span>已报送 <i>{{ r.progress_count }}</i> 期<template v-if="r.rejected_count"> · 被驳回 <i>{{ r.rejected_count }}</i> 次</template></span>
+            </div>
+            <pre v-if="r.requirement" class="rc-req">{{ r.requirement }}</pre>
+
+            <!-- 最近驳回原因 -->
+            <div v-if="r.status==='rejected'" class="rc-reject">↩ 第 {{ r.review_round }} 轮验收未通过：{{ r.verify_note }}（{{ r.verified_by }}）——请补充整改后重新报送并申请验收</div>
+            <div v-else-if="r.status==='reviewing'" class="rc-reviewing">⏳ 第 {{ r.review_round }} 轮验收申请已提交，等待内部管理员验收</div>
+            <div v-else-if="r.status==='accepted'" class="rc-accepted">✔ 已验收通过（{{ r.verified_by }} · {{ r.verified_at }}）<template v-if="r.verify_note">：{{ r.verify_note }}</template></div>
+            <div v-else-if="r.status==='cancelled'" class="rc-cancelled">✕ 该整改事项已被内部取消<template v-if="r.cancel_reason">：{{ r.cancel_reason }}</template></div>
+
+            <!-- 进度列表（展开） -->
+            <template v-if="openRect===r.id">
+              <div v-if="r.progress && r.progress.length" class="rc-progs">
+                <div v-for="p in r.progress" :key="p.id" class="rc-prog" :class="{review:p.submit_for_review}">
+                  <span class="rp-flag">{{ p.submit_for_review ? '✔ 申请验收' : '📈 过程进度' }}</span>
+                  <span class="rp-content">{{ p.content }}</span>
+                  <span v-if="p.attachments && p.attachments.length" class="rp-atts">
+                    📎 <span v-for="(a,i) in p.attachments" :key="i" class="rp-att">{{ a.name }}<i v-if="a.size">（{{ fmtSize(a.size) }}）</i></span>
+                  </span>
+                  <a v-if="p.source_url" :href="p.source_url" target="_blank" rel="noopener" class="rp-url">🔗 佐证链接</a>
+                  <em>{{ p.submitted_by || '—' }} · {{ p.created }}</em>
+                </div>
+              </div>
+              <div v-else class="rc-none">尚未报送进度，请按整改要求完成后报送第一期进展。</div>
+              <div class="rc-logs">
+                <div v-for="l in r.logs" :key="l.id" class="rclog" :class="l.operator_side">
+                  <span>{{ rectLogText(l.action) }}</span><i>{{ l.detail }}</i><em>{{ l.operator }} · {{ l.time }}</em>
+                </div>
+              </div>
+            </template>
+
+            <!-- 外部操作：整改中/已驳回可报送；待验收/终态仅可查看 -->
+            <div class="rc-actions">
+              <button v-if="['rectifying','rejected'].includes(r.status)" class="rc-op progress" @click="openProgress(r,false)">📈 报送进度</button>
+              <button v-if="['rectifying','rejected'].includes(r.status)" class="rc-op review" @click="openProgress(r,true)">✔ 完成整改·申请验收</button>
+              <button class="rc-op logbtn" @click="toggleRect(r)">{{ openRect===r.id ? '收起明细' : '🧾 进度与留痕' }}</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 报送进度/申请验收弹窗 -->
+      <div v-if="progressForm" class="modal-mask" @click.self="progressForm=null">
+        <div class="modal">
+          <h4>{{ progressForReview ? '✔ 报送并申请验收' : '📈 报送整改进度' }} · {{ progressForm.code }}</h4>
+          <p class="modal-hint">{{ progressForm.title }}<template v-if="progressForReview">；提交后事项进入「待验收」，等待内部管理员验收，期间不可再补充报送（驳回后可继续）。</template></p>
+          <textarea v-model="progressDraft.content" :placeholder="progressForReview ? '请说明全部整改项的完成情况、核验结论与公示情况…' : '本期整改进展、已完成措施、下期计划…'" required></textarea>
+          <input v-model="progressDraft.source_url" placeholder="佐证链接（整改公示页/检测报告页，可留空）" />
+          <input v-model="progressDraft.contact_info" placeholder="本次对接联系方式（可留空）" />
+          <div class="atts-edit">
+            <span class="lbl">📎 附件清单（演示登记文件信息，不上传实体文件）</span>
+            <div v-for="(a,i) in progressDraft.attachments" :key="i" class="att-row">
+              <input v-model="a.name" placeholder="文件名，如 检测报告.pdf" />
+              <input v-model.number="a.size" type="number" min="0" placeholder="大小(字节)" style="max-width:120px" />
+              <input v-model="a.type" placeholder="类型，如 application/pdf" style="max-width:200px" />
+              <button type="button" class="del-att" @click="progressDraft.attachments.splice(i,1)">✕</button>
+            </div>
+            <button type="button" class="add-att" @click="progressDraft.attachments.push({name:'',size:0,type:''})">＋ 添加附件</button>
+          </div>
+          <div class="modal-ops">
+            <button class="save" @click="submitProgressFn">{{ progressForReview ? '确认申请验收' : '报送进度' }}</button>
+            <button class="ghost" @click="progressForm=null">取消</button>
+          </div>
+        </div>
+      </div>
+
       <!-- 提交表单 -->
       <form v-if="showForm" class="sub-form" @submit.prevent="submit">
         <div class="row">
@@ -138,15 +227,26 @@ const loginError = ref('')
 const partner = ref(null)
 const crises = ref([])
 const mine = ref([])
+const rects = ref([])
+const rectBrief = ref({ rectifying: 0, reviewing: 0, accepted: 0 })
 const showForm = ref(false)
 const logId = ref(null)
+const openRect = ref(null)
+const progressForm = ref(null)
+const progressForReview = ref(false)
+const progressDraft = ref(blankProgress())
 const form = ref(blankForm())
 
 function blankForm() {
   return { doc_type: 'evidence', crisis_id: null, title: '', content: '', source_url: '', contact_info: '', is_urgent: false, attachments: [] }
 }
+function blankProgress() {
+  return { content: '', source_url: '', contact_info: '', attachments: [] }
+}
 function kindIcon(k) { return { brand: '🏢', regulator: '⚖️', media: '📰' }[k] || '🤝' }
 function stText(s) { return { monitoring: '监测中', disposal: '处置中', closed: '已结案' }[s] || s }
+function prioText(p) { return { urgent: '紧急', high: '高', normal: '普通' }[p] || p }
+function fmtTs(ms) { return ms ? new Date(ms).toLocaleString('zh-CN') : '—' }
 function fmtSize(n) {
   if (!n) return ''
   if (n >= 1048576) return (n / 1048576).toFixed(1) + 'MB'
@@ -155,6 +255,9 @@ function fmtSize(n) {
 function sideText(s) { return { internal: '内部', external: '我方', system: '系统' }[s] || s }
 function extLogText(a) {
   return { create: '提交', supplement: '补充材料', withdraw: '撤回', receive: '内部受理', accept: '审核采纳', reject: '审核驳回', bind: '挂接事件', urgent: '紧急升级' }[a] || a
+}
+function rectLogText(a) {
+  return { create: '建档', dispatch: '分派跟进', progress: '进度报送', submit: '报送验收', verify: '验收通过', reject: '验收驳回', cancel: '取消' }[a] || a
 }
 
 async function login(code) {
@@ -165,6 +268,8 @@ async function login(code) {
     partner.value = d.partner
     crises.value = d.crises
     mine.value = d.mine
+    rects.value = d.rectifications || []
+    rectBrief.value = d.rectBrief || { rectifying: 0, reviewing: 0, accepted: 0 }
   } catch (e) {
     partner.value = null
     loginError.value = e.message || '门户口令无效'
@@ -173,6 +278,8 @@ async function login(code) {
 function logout() {
   partner.value = null
   mine.value = []
+  rects.value = []
+  openRect.value = null
   inputCode.value = ''
   store.setPortalCode('')
 }
@@ -183,6 +290,17 @@ async function refresh() {
   partner.value = d.partner
   crises.value = d.crises
   mine.value = d.mine
+  rects.value = d.rectifications || []
+  rectBrief.value = d.rectBrief || rectBrief.value
+  // 展开中的整改项同步最新明细
+  if (openRect.value) {
+    const full = rects.value.find((x) => x.id === openRect.value)
+    if (full && (!full.logs || !full.progress)) {
+      const detail = await store.portalRectFetch(full.id)
+      const idx = rects.value.findIndex((x) => x.id === full.id)
+      if (idx >= 0) rects.value[idx] = detail
+    }
+  }
 }
 async function submit() {
   // 清理空附件行
@@ -200,6 +318,30 @@ async function withdraw(s) {
   const reason = window.prompt('撤回原因（可留空）：') || ''
   if (reason === null) return
   await store.portalWithdraw(s.id, reason.trim())
+  refresh()
+}
+// ===== 整改事项：展开明细 / 报送进度 / 申请验收 =====
+async function toggleRect(r) {
+  if (openRect.value === r.id) { openRect.value = null; return }
+  openRect.value = r.id
+  if (!r.logs || !r.progress) {
+    const detail = await store.portalRectFetch(r.id)
+    const idx = rects.value.findIndex((x) => x.id === r.id)
+    if (idx >= 0) rects.value[idx] = detail
+  }
+}
+function openProgress(r, forReview) {
+  progressForm.value = r
+  progressForReview.value = !!forReview
+  progressDraft.value = blankProgress()
+}
+async function submitProgressFn() {
+  if (!progressDraft.value.content.trim()) { store.msg('请填写本期整改进度说明', 'warn'); return }
+  const body = { ...progressDraft.value }
+  body.attachments = (body.attachments || []).filter((a) => a.name && a.name.trim())
+  body.submit_for_review = progressForReview.value
+  await store.portalRectProgress(progressForm.value.id, body)
+  progressForm.value = null
   refresh()
 }
 async function toggleLogs(s) {
@@ -303,4 +445,75 @@ onUnmounted(() => clearInterval(timer))
 .mlog b{min-width:56px;color:#dbe4f3;}
 .mlog span{color:#aebadd;flex:1;min-width:180px;}
 .mlog em{color:#6f84ab;font-style:normal;font-size:11px;}
+/* ===== 整改事项（门户） ===== */
+.rect-block{background:linear-gradient(160deg,#0c2342,#0b1a33);border:1px solid rgba(38,166,154,.28);border-radius:14px;padding:14px 16px;display:flex;flex-direction:column;gap:8px;}
+.rect-block h3{margin:0;font-size:15px;color:#80cbc4;display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+.rect-brief{display:inline-flex;gap:6px;font-size:11px;font-weight:400;}
+.rect-brief i{font-style:normal;border-radius:9px;padding:2px 9px;}
+.rect-brief .b-wait{background:#3e2f0a;color:#ffe082;}
+.rect-brief .b-rev{background:#3d1a4d;color:#ce93d8;}
+.rect-brief .b-ok{background:#143d1c;color:#a5d6a7;}
+.rect-hint{margin:0;font-size:12px;color:#8ba2c8;line-height:1.7;}
+.rect-list{display:flex;flex-direction:column;gap:10px;}
+.rect-card{background:#0a1730;border:1px solid rgba(120,160,220,0.16);border-radius:11px;padding:12px 14px;border-left:4px solid #26a69a;}
+.rect-card.pending{border-left-color:#ef5350;}
+.rect-card.rectifying{border-left-color:#fb8c00;}
+.rect-card.reviewing{border-left-color:#ab47bc;}
+.rect-card.rejected{border-left-color:#8d6e63;}
+.rect-card.accepted{border-left-color:#43a047;}
+.rect-card.cancelled{border-left-color:#607d8b;opacity:.85;}
+.rect-card.overdue{box-shadow:0 0 0 1px rgba(239,83,80,.35);}
+.rc-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;}
+.rc-head .code{font-family:monospace;background:#0c1730;border:1px solid rgba(120,160,220,0.35);border-radius:5px;padding:2px 8px;font-size:11px;color:#80cbc4;}
+.rc-st{font-size:11px;padding:2px 9px;border-radius:10px;font-weight:700;background:#0d302c;color:#80cbc4;}
+.rc-st.pending{background:#5d1a1a;color:#ff8a80;}
+.rc-st.rectifying{background:#5d3a10;color:#ffcc80;}
+.rc-st.reviewing{background:#3d1a4d;color:#ce93d8;}
+.rc-st.accepted{background:#143d1c;color:#a5d6a7;}
+.rc-st.rejected{background:#3e2723;color:#bcaaa4;}
+.rc-st.cancelled{background:#263238;color:#90a4ae;}
+.rc-prio{font-size:10px;padding:2px 8px;border-radius:9px;background:#0d2137;color:#90caf9;}
+.rc-prio.urgent{background:#4a1518;color:#ef9a9a;}
+.rc-overdue{font-size:10px;color:#fff;background:#c62828;border-radius:9px;padding:2px 8px;font-weight:700;}
+.rc-title{font-size:13px;}
+.rc-meta{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0;font-size:12px;color:#8ba2c8;}
+.rc-meta i{color:#dbe4f3;font-style:normal;}
+.rc-meta .due{color:#ffb74d;}
+.rc-detached{color:#90a4ae;}
+.rc-req{white-space:pre-wrap;font-family:inherit;font-size:12px;line-height:1.7;color:#c6d3ea;margin:4px 0;background:#0c1730;border-radius:8px;padding:9px 12px;border:1px solid rgba(120,160,220,0.12);}
+.rc-reject{background:#3e272355;border:1px solid #8d6e6380;color:#d7ccc8;border-radius:8px;padding:8px 12px;font-size:12px;margin:6px 0;line-height:1.6;}
+.rc-reviewing{background:#3d1a4d33;border:1px solid #8e24aa80;color:#ce93d8;border-radius:8px;padding:8px 12px;font-size:12px;margin:6px 0;}
+.rc-accepted{background:#143d1c55;border:1px solid #43a04780;color:#a5d6a7;border-radius:8px;padding:8px 12px;font-size:12px;margin:6px 0;}
+.rc-cancelled{background:#26323855;border:1px solid #607d8b80;color:#b0bec5;border-radius:8px;padding:8px 12px;font-size:12px;margin:6px 0;}
+.rc-progs{display:flex;flex-direction:column;gap:6px;margin-top:6px;}
+.rc-prog{background:#0c1a30;border:1px solid rgba(120,160,220,0.14);border-radius:8px;padding:8px 10px;font-size:12px;display:flex;flex-direction:column;gap:3px;}
+.rc-prog.review{border-color:rgba(171,71,188,.4);}
+.rp-flag{font-size:10px;font-weight:700;color:#90caf9;}
+.rc-prog.review .rp-flag{color:#ce93d8;}
+.rp-content{color:#dbe4f3;line-height:1.6;white-space:pre-wrap;}
+.rp-atts{display:flex;gap:8px;flex-wrap:wrap;font-size:11px;color:#aebadd;}
+.rp-att{background:#13233f;border-radius:6px;padding:2px 8px;}
+.rp-att i{color:#6f84ab;font-style:normal;margin-left:3px;}
+.rp-url{font-size:11px;color:#90caf9;text-decoration:none;}
+.rc-prog em{font-size:10px;color:#6f84ab;font-style:normal;}
+.rc-logs{margin-top:8px;border-top:1px dashed rgba(120,160,220,0.16);padding-top:7px;display:flex;flex-direction:column;gap:4px;max-height:190px;overflow-y:auto;}
+.rclog{display:flex;gap:8px;font-size:11px;color:#aebadd;flex-wrap:wrap;}
+.rclog span{color:#80cbc4;font-weight:600;flex:none;}
+.rclog i{font-style:normal;flex:1;min-width:160px;}
+.rclog em{color:#6f84ab;font-style:normal;}
+.rc-none{font-size:12px;color:#6f84ab;text-align:center;padding:8px 0;}
+.rc-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;}
+.rc-op{border-radius:7px;padding:6px 12px;font-size:12px;cursor:pointer;background:transparent;}
+.rc-op.progress{border:1px solid #26a69a;color:#80cbc4;}
+.rc-op.review{border:1px solid #ab47bc;color:#ce93d8;font-weight:600;}
+.rc-op.logbtn{border:1px solid rgba(120,160,220,0.35);color:#aebadd;}
+.modal-mask{position:fixed;inset:0;background:rgba(4,10,22,.72);z-index:60;display:flex;align-items:center;justify-content:center;padding:20px;}
+.modal{background:#0f1d38;border:1px solid rgba(120,160,220,0.3);border-radius:14px;padding:20px;width:560px;max-width:100%;display:flex;flex-direction:column;gap:10px;max-height:88vh;overflow-y:auto;}
+.modal h4{margin:0;font-size:15px;}
+.modal-hint{margin:0;font-size:12px;color:#8ba2c8;line-height:1.6;}
+.modal input,.modal textarea{background:#13233f;border:1px solid rgba(120,160,220,0.25);color:#dbe4f3;border-radius:8px;padding:9px 11px;font-size:13px;font-family:inherit;}
+.modal textarea{min-height:110px;resize:vertical;}
+.modal-ops{display:flex;gap:10px;justify-content:flex-end;}
+.del-att{background:transparent;border:1px solid rgba(239,83,80,.5);color:#ef9a9a;border-radius:7px;width:38px;cursor:pointer;}
+.add-att{align-self:flex-start;background:transparent;border:1px dashed rgba(120,160,220,0.4);color:#90caf9;border-radius:7px;padding:6px 12px;font-size:12px;cursor:pointer;}
 </style>
