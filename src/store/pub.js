@@ -43,6 +43,8 @@ export const usePubStore = defineStore('pub', {
     stmtOpenId: null,        // 跳转声明页时自动展开详情
     extOpenId: null,         // 从危机时间线锚点带入的待展开外部提交 id
     extFilterCrisis: null,   // 从危机卡片跳转外部协作看板带入的危机过滤
+    rectOpenId: null,        // 从危机时间线锚点/卡片带入的待展开整改事项 id
+    rectFilterCrisis: null,  // 从危机卡片跳转整改看板带入的危机过滤
     toast: null
   }),
   actions: {
@@ -371,6 +373,46 @@ export const usePubStore = defineStore('pub', {
       else this.msg(`已解除危机挂接（移出时间线 ${r.movedTimeline ?? 0} 条、通知任务 ${r.repointedTasks ?? 0} 条）`, 'success')
       return r
     },
+    // ===== 危机整改事项（内部看板：管理员建档/验收 · 值班员分派跟进/催办） =====
+    async fetchRects(filter) { return await api('/rects', 'GET', null, filter) },
+    async fetchRectOptions() { return await api('/rects/options') },
+    async fetchRect(id) { return (await api(`/rects/${id}`)).rect },
+    async createRect(body) {
+      const r = await api('/rects', 'POST', body)
+      await this.load()
+      this.msg(`整改事项 ${r.code} 已创建${r.status === 'todo' ? '，待分派跟进' : '，已指派协作方落实'}`, 'success')
+      return r
+    },
+    async assignRect(id, body) {
+      const r = await api(`/rects/${id}/assign`, 'POST', body)
+      await this.load()
+      this.msg('整改事项已分派跟进人，协作方将收到通知', 'success')
+      return r
+    },
+    async remindRect(id, content) {
+      const r = await api(`/rects/${id}/remind`, 'POST', { content })
+      await this.load()
+      this.msg(`已发起第 ${r.seq} 次催办，协作方将收到通知`, 'success')
+      return r
+    },
+    async acceptRect(id, body) {
+      const r = await api(`/rects/${id}/accept`, 'POST', body)
+      await this.load()
+      this.msg(`整改事项验收通过${r.resolved ? `，联动解除 ${r.resolved} 条预警` : ''}`, 'success')
+      return r
+    },
+    async rejectRect(id, reason) {
+      const r = await api(`/rects/${id}/reject`, 'POST', { reason })
+      await this.load()
+      this.msg('已驳回，协作方可在门户查看原因并重新报验', 'info')
+      return r
+    },
+    async cancelRect(id, reason) {
+      const r = await api(`/rects/${id}/cancel`, 'POST', { reason })
+      await this.load()
+      this.msg('整改事项已取消', 'info')
+      return r
+    },
     // ===== 外部协作门户（协作方口令鉴权） =====
     setPortalCode(code) { portalCode = code },
     async portalBootstrap() { return await portalApi('/bootstrap') },
@@ -391,6 +433,14 @@ export const usePubStore = defineStore('pub', {
       const r = await portalApi(`/submissions/${id}/withdraw`, 'POST', { reason })
       await this.load()
       this.msg('提交已撤回', 'info')
+      return r
+    },
+    // ===== 危机整改事项（门户侧：协作方提交进度/报验） =====
+    async portalFetchRect(id) { return (await portalApi(`/rects/${id}`)).rect },
+    async portalRectProgress(id, body) {
+      const r = await portalApi(`/rects/${id}/progress`, 'POST', body)
+      await this.load()
+      this.msg(body.submit ? (body.is_urgent ? '已提交报验（紧急，已联动内部升级）' : '已提交报验，等待管理员验收') : '整改进度已提交', 'success')
       return r
     }
   }

@@ -11,7 +11,7 @@
       </div>
       <span class="me">👤 {{ store.user.name }} · {{ roleText(store.user.role) }}</span>
     </div>
-    <p class="hint">🔗 复盘报告汇总<b>预警、处置时间线、传播路径、协同工单、危机声明、外部协作反馈、通知回执</b>同源快照；支持跨角色分段编制 → 提交审核 → 审核发布（驳回可重编），每次送审/发布/回滚均归档不可变版本，已发布版本可一键回滚；审核通过自动回写结案档案与统计口径。</p>
+    <p class="hint">🔗 复盘报告汇总<b>预警、处置时间线、传播路径、协同工单、危机声明、外部协作反馈、危机整改事项、通知回执</b>同源快照；支持跨角色分段编制 → 提交审核 → 审核发布（驳回可重编），每次送审/发布/回滚均归档不可变版本，已发布版本可一键回滚；审核通过自动回写结案档案与统计口径。</p>
 
     <!-- 创建报告 -->
     <form v-if="showForm" class="rp-form" @submit.prevent="create">
@@ -202,6 +202,31 @@
               </div>
             </section>
 
+            <!-- 危机整改事项（外部落实/值班员跟进/管理员验收，含报验轮次与进度留痕） -->
+            <section class="snap-sec">
+              <h5>🛠 危机整改事项（{{ (snap.rectifications && snap.rectifications.total) || 0 }} 项 · 已验收 {{ (snap.rectifications && snap.rectifications.accepted) || 0 }}<template v-if="snap.rectifications && snap.rectifications.open"> · 未办结 {{ snap.rectifications.open }}</template><template v-if="snap.rectifications && snap.rectifications.rounds"> · 报验 {{ snap.rectifications.rounds }} 轮次</template>）</h5>
+              <div v-if="!snap.rectifications || !snap.rectifications.total" class="snap-empty">该事件暂无危机整改事项</div>
+              <div v-for="ri in (snap.rectifications && snap.rectifications.items) || []" :key="ri.id" class="rect-snap" :class="ri.status">
+                <div class="rect-snap-head">
+                  <span class="code">{{ ri.code }}</span>
+                  <span class="tag" :class="'rist-'+ri.status">{{ rectStatusText(ri.status) }}</span>
+                  <b>{{ ri.title }}</b>
+                  <span v-if="ri.priority==='urgent'" class="rect-urgent">⚡ 紧急</span>
+                  <span class="rect-who" v-if="ri.partner_name">{{ extKindText(ri.partner_kind) }} · {{ ri.partner_name }}</span>
+                  <span class="rect-who" v-else>待分派</span>
+                </div>
+                <div class="rect-snap-meta">
+                  跟进人 {{ ri.follower || '—' }}<template v-if="ri.due_at"> · 期限 {{ ri.due_at }}</template>
+                  <template v-if="ri.work_order_id"> · 📋 关联工单 #{{ ri.work_order_id }}</template> · 进度留痕 {{ ri.progressCount }} 条<template v-if="ri.review_round"> · 报验 {{ ri.review_round }} 轮</template>
+                </div>
+                <span v-if="ri.accepted_note" class="rect-note">✔ {{ ri.accepted_by }}（{{ ri.accepted_at }}）：{{ ri.accepted_note }}</span>
+                <span v-else-if="ri.reject_reason" class="rect-note reject">↩ {{ ri.rejected_by }}：{{ ri.reject_reason }}</span>
+                <div v-if="ri.progress && ri.progress.length" class="rect-prog">
+                  <span v-for="(p,i) in ri.progress.slice(-3)" :key="i" class="rp-line">· {{ p.operator_side==='external' ? '协作方' : p.operator_side==='internal' ? '内部' : '系统' }}{{ actionTextOf(p.action) }}：{{ p.content.slice(0,80) }}（{{ p.time }}）</span>
+                </div>
+              </div>
+            </section>
+
             <!-- 通知回执（与危机看板/工单调度链路同口径） -->
             <section class="snap-sec">
               <h5>🔔 通知与回执（{{ snap.notifications.total }} 条 · 已回执 {{ snap.notifications.acked }} · 已升级 {{ snap.notifications.escalated }}<template v-if="snap.notifications.retries"> · 自动重试 {{ snap.notifications.retries }}</template>）</h5>
@@ -323,6 +348,8 @@ function stmtChText(x) { return { pending: '待执行', publishing: '执行中',
 function extStatusText(x) { return { pending: '待审核', reviewing: '受理中', accepted: '已采纳', rejected: '已驳回', withdrawn: '已撤回' }[x] || x }
 function extKindText(x) { return { brand: '品牌方', regulator: '监管方', media: '媒体' }[x] || x }
 function extDocText(x) { return { evidence: '证据材料', rectify: '整改进度', clue: '线索反映' }[x] || x }
+function rectStatusText(x) { return { todo: '待分派', progress: '整改中', review: '待验收', accepted: '已验收', rejected: '已驳回', cancelled: '已取消' }[x] || x }
+function actionTextOf(a) { return { create: '新建', assign: '分派', progress: '提交进度', submit: '报验', review: '报验登记', remind: '催办', accept: '验收通过', reject: '驳回', cancel: '取消' }[a] || a }
 function formatNum(n) { return n >= 10000 ? (n / 10000).toFixed(1) + ' 万' : String(n || 0) }
 function hasReport(crisisId) { return items.value.some((r) => r.crisis_id === crisisId) }
 
@@ -562,6 +589,17 @@ input,select,textarea,button{font-family:inherit;}
 .ext-who{color:#aebadd;}
 .ext-snap-meta{font-size:10px;color:#8ba2c8;}
 .ext-note{font-size:10px;color:#a5d6a7;}.ext-note.reject{color:#ce93d8;}
+.rect-snap{background:#0c1a30;border:1px solid rgba(38,166,154,.22);border-left:3px solid #26a69a;border-radius:7px;padding:8px 11px;margin-bottom:6px;display:flex;flex-direction:column;gap:5px;}
+.rect-snap.accepted{border-left-color:#66bb6a;}.rect-snap.rejected{border-left-color:#ab47bc;}.rect-snap.review{border-left-color:#ffa726;}.rect-snap.cancelled{border-left-color:#616161;opacity:.8;}
+.rect-snap-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px;color:#8ba2c8;}
+.rect-snap-head b{color:#dbe4f3;}
+.rect-snap-head .code{font-family:monospace;color:#80cbc4;background:#0a2320;border-radius:5px;padding:0 6px;}
+.rect-who{color:#aebadd;}
+.rect-urgent{font-size:10px;color:#fff;background:#c62828;border-radius:8px;padding:0 7px;}
+.rect-snap-meta{font-size:10px;color:#8ba2c8;}
+.rect-note{font-size:10px;color:#a5d6a7;}.rect-note.reject{color:#ce93d8;}
+.rect-prog{display:flex;flex-direction:column;gap:2px;font-size:10px;color:#8ba2c8;}
+.rp-line{line-height:1.5;}
 .st-todo{background:#37474f;color:#cfd8dc;}.st-doing{background:#0d47a1;color:#bbdefb;}.st-blocked{background:#4e342e;color:#ffcc80;}
 .st-done{background:#1b5e20;color:#a5d6a7;}.st-cancelled{background:#263238;color:#90a4ae;}
 .nt-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px;}

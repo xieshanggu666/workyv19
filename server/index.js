@@ -25,7 +25,7 @@ import {
   blockWorkOrder, completeWorkOrder, reworkWorkOrder, cancelWorkOrder,
   startWorkOrderScheduler, bindWorkOrderNotify
 } from './workorders.js'
-import { generateForWorkOrder, generateForPropEvent, seedPropNotifyTasks, generateForExtSubmission, seedExtNotifyTasks, seedStatementNotifyTasks } from './notify.js'
+import { generateForWorkOrder, generateForPropEvent, seedPropNotifyTasks, generateForExtSubmission, seedExtNotifyTasks, seedStatementNotifyTasks, generateForRectItem, seedRectNotifyTasks, deleteNotifyOfRects } from './notify.js'
 import { crisisDispatchRollup } from './dispatch.js'
 import { bindPipelineProp } from './pipeline.js'
 import {
@@ -56,6 +56,13 @@ import {
   receiveSubmission, acceptSubmission, rejectSubmission, bindSubmissionCrisis,
   detachSubmissionsOfCrisis, healSubmissionCrisisLinks
 } from './portal.js'
+import {
+  RECT_STATUS, RECT_PRIORITY,
+  listRectItems, getRectItem, rectSummary, crisisRectBrief,
+  bindRectifyNotify, getRectItemForPartner, partnerRectBootstrap,
+  createRectItem, assignRectItem, remindRectItem, submitRectProgress,
+  acceptRectItem, rejectRectItem, cancelRectItem, deleteRectsOfCrisis
+} from './rectify.js'
 import { closureReadiness, closeCrisis, reopenCrisis } from './closures.js'
 
 const app = express()
@@ -113,6 +120,13 @@ if (seededExt) console.log(`[PORTAL] 为存量紧急外部提交生成 ${seededE
 // 危机声明：为存量「部分渠道失败」声明补生成督办通知（幂等），失败渠道重试/超时升级复用通知调度
 const seededStmt = seedStatementNotifyTasks()
 if (seededStmt) console.log(`[STMT] 为存量部分渠道失败声明生成 ${seededStmt} 个督办通知`)
+// 危机整改事项：注入通知联动钩子（分派/进度/报验/催办/驳回/验收 → 复用通知编排），并为存量待验收事项补生成通知（幂等）
+bindRectifyNotify({
+  notifyOnRect: (id, event, opts) => generateForRectItem(id, event, opts),
+  deleteNotifyOfRects: (ids) => deleteNotifyOfRects(ids)
+})
+const seededRect = seedRectNotifyTasks()
+if (seededRect) console.log(`[RECT] 为存量待验收整改事项生成 ${seededRect} 个报验通知`)
 
 // 危机列表（含来源规则、承接规则、未解除预警数、协同工单统计、时间线）
 function crisisList(withTimeline = false) {
@@ -139,6 +153,7 @@ function crisisList(withTimeline = false) {
     item.report = crisisReportBrief(c.id) // 复盘报告状态（编制中/待审核/已发布 + 当前版本）
     item.statement = crisisStatementBrief(c.id) // 最新危机声明状态（危机卡片角标）
     item.extPortal = crisisSubmissionBrief(c.id) // 外部协作门户待审核提交（含紧急数）
+    item.rect = crisisRectBrief(c.id) // 危机整改事项（在办/待验收/已验收数）
     if (withTimeline) item.timeline = q('SELECT * FROM crisis_timeline WHERE crisis_id=? ORDER BY id DESC', c.id)
     return item
   })
@@ -180,7 +195,13 @@ app.get('/api/state', (req, res) => {
     (SELECT COUNT(*) FROM ext_submissions WHERE status='pending') extPending,
     (SELECT COUNT(*) FROM ext_submissions WHERE status='reviewing') extReviewing,
     (SELECT COUNT(*) FROM ext_submissions WHERE is_urgent=1 AND status IN ('pending','reviewing')) extUrgentOpen,
-    (SELECT COUNT(*) FROM ext_submissions WHERE status='accepted') extAccepted`, Date.now())
+    (SELECT COUNT(*) FROM ext_submissions WHERE status='accepted') extAccepted,
+    (SELECT COUNT(*) FROM rect_items WHERE status IN ('todo','progress','review','rejected')) rectOpen,
+    (SELECT COUNT(*) FROM rect_items WHERE status='todo') rectTodo,
+    (SELECT COUNT(*) FROM rect_items WHERE status='review') rectReview,
+    (SELECT COUNT(*) FROM rect_items WHERE status='rejected') rectRejected,
+    (SELECT COUNT(*) FROM rect_items WHERE priority='urgent' AND status IN ('todo','progress','review','rejected')) rectUrgentOpen,
+    (SELECT COUNT(*) FROM rect_items WHERE status='accepted') rectAccepted`, Date.now())
   // 热度趋势（近7时段）
   const nowH = new Date().getHours()
   const trend = []
@@ -565,7 +586,9 @@ app.delete('/api/crisis/:id', (req, res) => {
     run('DELETE FROM crisis_closures WHERE crisis_id=?', cid)
     // 复盘报告随事件删除（版本归档与操作留痕一并清理）
     deleteReportsOfCrisis(cid)
-    // 通知任务级联（须在工单删除前执行，按工单归属识别任务）：工单链路/危机状态类任务随事件删除，
+    // 危机整改事项随事件删除（整改进度留痕一并清理；须在通知级联前删除，整改类通知任务按 rect_item_id 识别）
+    deleteRectsOfCrisis(cid)
+    // 通知任务级联（须在工单删除前执行，按工单归属识别任务）：工单链路/危机状态类/整改类任务随事件删除，
     // 预警/传播/外部协作类任务仅解除危机引用（来源对象保留）——不留幽灵任务，调度器不再发送，统计同步扣减
     notifyClean = deleteNotifyOfCrisis(cid)
     // 协同工单随事件删除（工单日志一并清理）
@@ -774,13 +797,13 @@ app.post('/api/notify/subs', guard('admin'), (req, res) => {
   const err = validateSub(req.body)
   if (err) return res.status(400).json({ error: err })
   const b = req.body
-  run(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,wo_event,prop_event,ext_event,stmt_event,active,created,created_by)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+  run(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,wo_event,prop_event,ext_event,stmt_event,rect_event,active,created,created_by)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
     b.name.trim(), b.alert_id ? +b.alert_id : null, (b.topic || '').trim(), String(b.crisis_status || ''),
     (Array.isArray(b.levels) ? b.levels : []).filter((x) => ['red', 'orange', 'yellow'].includes(x)).join(','),
     JSON.stringify(b.channel_ids.map(Number)), b.require_ack ? 1 : 0,
     Math.max(1, +b.ack_timeout_min || 30), b.escalate_channel_id ? +b.escalate_channel_id : null,
-    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), String(b.prop_event || ''), String(b.ext_event || ''), String(b.stmt_event || ''), now(), req.actor.user)
+    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), String(b.prop_event || ''), String(b.ext_event || ''), String(b.stmt_event || ''), String(b.rect_event || ''), now(), req.actor.user)
   res.json({ ok: true })
 })
 app.put('/api/notify/subs/:id', guard('admin'), (req, res) => {
@@ -789,12 +812,12 @@ app.put('/api/notify/subs/:id', guard('admin'), (req, res) => {
   const err = validateSub(req.body)
   if (err) return res.status(400).json({ error: err })
   const b = req.body
-  run(`UPDATE notify_subs SET name=?,alert_id=?,topic=?,crisis_status=?,levels=?,channel_ids=?,require_ack=?,ack_timeout_min=?,escalate_channel_id=?,max_retry=?,wo_event=?,prop_event=?,ext_event=?,stmt_event=? WHERE id=?`,
+  run(`UPDATE notify_subs SET name=?,alert_id=?,topic=?,crisis_status=?,levels=?,channel_ids=?,require_ack=?,ack_timeout_min=?,escalate_channel_id=?,max_retry=?,wo_event=?,prop_event=?,ext_event=?,stmt_event=?,rect_event=? WHERE id=?`,
     b.name.trim(), b.alert_id ? +b.alert_id : null, (b.topic || '').trim(), String(b.crisis_status || ''),
     (Array.isArray(b.levels) ? b.levels : []).filter((x) => ['red', 'orange', 'yellow'].includes(x)).join(','),
     JSON.stringify(b.channel_ids.map(Number)), b.require_ack ? 1 : 0,
     Math.max(1, +b.ack_timeout_min || 30), b.escalate_channel_id ? +b.escalate_channel_id : null,
-    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), String(b.prop_event || ''), String(b.ext_event || ''), String(b.stmt_event || ''), s.id)
+    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), String(b.prop_event || ''), String(b.ext_event || ''), String(b.stmt_event || ''), String(b.rect_event || ''), s.id)
   res.json({ ok: true })
 })
 app.post('/api/notify/subs/:id/toggle', guard('admin'), (req, res) => {
@@ -1159,6 +1182,25 @@ app.post('/api/portal/submissions/:id/withdraw', (req, res) => {
   res.json(r)
 })
 
+// ---------- 外部门户：危机整改事项（协作方提交整改进度/报验） ----------
+// 门户首页 bootstrap 已下发本人被指派的整改事项；这里提供单条详情与进度/报验提交（口令必须属于被指派方）
+app.get('/api/portal/rects/:id', (req, res) => {
+  const partner = partnerOf(req)
+  if (!partner) return res.status(401).json({ error: '门户口令无效或协作方已停用' })
+  const r = getRectItemForPartner(+req.params.id, partner.id)
+  if (!r) return res.status(404).json({ error: '整改事项不存在或无权查看' })
+  res.json({ rect: r })
+})
+// 提交整改进度（submit=false 仅追加进度；submit=true 提交报验→待管理员验收，紧急报验联动升级通知）
+app.post('/api/portal/rects/:id/progress', (req, res) => {
+  const partner = partnerOf(req)
+  if (!partner) return res.status(401).json({ error: '门户口令无效或协作方已停用' })
+  const r = submitRectProgress(+req.params.id, req.body, partner)
+  if (!r) return res.status(404).json({ error: '整改事项不存在或无权操作' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.status(201).json(r)
+})
+
 // ---------- 内部审核看板（内部权限模型） ----------
 app.get('/api/ext-partners', (req, res) => {
   res.json({ items: listPartners(), dict: { kind: PARTNER_KIND } })
@@ -1223,6 +1265,77 @@ app.post('/api/ext-submissions/:id/reject', guard('admin'), (req, res) => {
 app.post('/api/ext-submissions/:id/crisis', guard('ops'), (req, res) => {
   const r = bindSubmissionCrisis(+req.params.id, req.body, req.actor)
   if (!r) return res.status(404).json({ error: '外部提交不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+
+// ===== 危机整改事项（管理员建档/验收 · 值班员分派跟进/催办 · 协作方门户提交进度/报验） =====
+// 看板（状态/危机/协作方过滤 + 汇总 + 字典；viewer 只读）
+app.get('/api/rects', (req, res) => {
+  res.json({
+    items: listRectItems({
+      status: String(req.query.status || ''),
+      crisisId: req.query.crisis_id ? +req.query.crisis_id : null,
+      partnerId: req.query.partner_id ? +req.query.partner_id : null
+    }),
+    summary: rectSummary(),
+    dict: { status: RECT_STATUS, priority: RECT_PRIORITY },
+    actor: actorOf(req)
+  })
+})
+// 协作方清单 + 未结案危机 + 在办工单（建档/分派对齐下拉）
+app.get('/api/rects/options', (req, res) => {
+  res.json({
+    partners: q('SELECT id,name,kind,contact,enabled FROM ext_partners WHERE enabled=1 ORDER BY id'),
+    crises: q("SELECT id,title,level,status FROM crisis WHERE status!='closed' ORDER BY id DESC"),
+    workOrders: q("SELECT id,crisis_id,title,status FROM work_orders WHERE status IN ('todo','doing','blocked','rework') ORDER BY id DESC"),
+    submissions: q("SELECT id,crisis_id,code,title,doc_type,status FROM ext_submissions WHERE status='accepted' ORDER BY id DESC")
+  })
+})
+// 整改事项详情（含进度与全程留痕）
+app.get('/api/rects/:id', (req, res) => {
+  const r = getRectItem(+req.params.id)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
+  res.json({ rect: r })
+})
+// 新建整改事项（仅 admin：必须挂接未结案危机；可同时指派协作方，也可留空待值班员分派）
+app.post('/api/rects', guard('admin'), (req, res) => {
+  const r = createRectItem(req.body, req.actor)
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.status(201).json(r)
+})
+// 分派/改派跟进（ops+：指定负责协作方与内部跟进人）
+app.post('/api/rects/:id/assign', guard('ops'), (req, res) => {
+  const r = assignRectItem(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+// 催办（ops+：每次催办联动通知协作方，按次数幂等）
+app.post('/api/rects/:id/remind', guard('ops'), (req, res) => {
+  const r = remindRectItem(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+// 验收通过（仅 admin；可勾选联动解除该危机全部未解除预警）
+app.post('/api/rects/:id/accept', guard('admin'), (req, res) => {
+  const r = acceptRectItem(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+// 验收驳回（仅 admin：驳回原因协作方门户可见，补充进度后可重新报验）
+app.post('/api/rects/:id/reject', guard('admin'), (req, res) => {
+  const r = rejectRectItem(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+// 取消整改事项（仅 admin：建错/重复/要求撤销）
+app.post('/api/rects/:id/cancel', guard('admin'), (req, res) => {
+  const r = cancelRectItem(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '整改事项不存在' })
   if (r.error) return res.status(400).json({ error: r.error })
   res.json(r)
 })

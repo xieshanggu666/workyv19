@@ -110,6 +110,7 @@
                 <option value="prop">🕸 传播路径事件</option>
                 <option value="ext">🤝 外部协作门户</option>
                 <option value="stmt">📢 危机声明渠道</option>
+                <option value="rect">🛠 危机整改事项</option>
               </select>
               <select v-if="subForm.mode==='alert'" v-model="subForm.alert_id">
                 <option :value="null">全部规则</option>
@@ -133,13 +134,22 @@
                 <option value="partial">部分渠道失败·发布未完成（督办，建议需回执）</option>
                 <option value="degraded">降级发布·失败渠道降级终止（知会留痕）</option>
               </select>
+              <select v-else-if="subForm.mode==='rect'" v-model="subForm.rect_event">
+                <option value="assigned">分派/改派给协作方与跟进人</option>
+                <option value="submitted">协作方提交整改进度</option>
+                <option value="review">提交报验/紧急报验（升级督办，建议需回执）</option>
+                <option value="remind">值班员催办</option>
+                <option value="rejected">验收驳回（退回重新整改）</option>
+                <option value="accepted">验收通过（办结知会）</option>
+                <option value="created">新建整改事项</option>
+              </select>
               <select v-else v-model="subForm.prop_event">
                 <option value="outbreak">进入爆发期（爆发升级）</option>
                 <option value="surge">传播异动（热度激增 / KOL 加入）</option>
               </select>
             </div>
             <div class="row">
-              <input v-if="!['wo','ext','stmt'].includes(subForm.mode)" v-model="subForm.topic" list="topic-list" placeholder="限定话题（留空=不限）" />
+              <input v-if="!['wo','ext','stmt','rect'].includes(subForm.mode)" v-model="subForm.topic" list="topic-list" placeholder="限定话题（留空=不限）" />
               <datalist id="topic-list"><option v-for="t in topics" :key="t" :value="t" /></datalist>
               <div v-if="subForm.mode==='alert'" class="lv-checks">
                 <label v-for="l in levels" :key="l.k"><input type="checkbox" v-model="subForm.levels" :value="l.k" /> {{ l.t }}</label>
@@ -163,13 +173,13 @@
               <input v-model.number="subForm.max_retry" type="number" min="1" max="5" placeholder="重试上限" />
             </div>
             <button class="save" type="submit">保存订阅</button>
-            <p class="hint">💡 预警订阅按「规则 + 话题 + 级别」匹配；危机订阅按状态流转；工单订阅按拆分分派/超时升级匹配。需回执的任务超时未确认将自动升级；回执会同步解除关联预警并写入危机时间线。</p>
+            <p class="hint">💡 预警订阅按「规则 + 话题 + 级别」匹配；危机订阅按状态流转；工单/传播/外部协作/声明/整改订阅按各自业务事件匹配。需回执的任务超时未确认将自动升级；回执会同步解除关联预警并写入危机时间线。</p>
           </form>
           <div class="sub-list">
             <div v-for="s in subs" :key="s.id" class="sub" :class="{off:!s.active}">
               <div class="s-head">
                 <b>{{ s.name }}</b>
-                <span class="s-kind">{{ s.stmt_event ? '📢 声明·'+(s.stmt_event==='partial'?'部分失败督办':'渠道失败提醒') : s.ext_event ? '🤝 外部协作·'+(s.ext_event==='escalated'?'紧急升级':'提交到达') : s.prop_event ? '🕸 传播·'+(s.prop_event==='outbreak'?'爆发升级':'异动/激增/KOL') : s.wo_event ? '📋 工单·'+(s.wo_event==='escalated'?'超时升级':'拆分分派') : s.crisis_status ? '🛟 危机·'+crisisStatus[s.crisis_status] : '🚨 预警' }}</span>
+                <span class="s-kind">{{ s.rect_event ? '🛠 整改·'+({ assigned: '分派跟进', submitted: '进度提交', review: '报验/紧急升级', remind: '催办', rejected: '验收驳回', accepted: '验收通过', created: '新建' }[s.rect_event] || s.rect_event) : s.stmt_event ? '📢 声明·'+(s.stmt_event==='partial'?'部分失败督办':s.stmt_event==='degraded'?'降级知会':'渠道失败提醒') : s.ext_event ? '🤝 外部协作·'+(s.ext_event==='escalated'?'紧急升级':'提交到达') : s.prop_event ? '🕸 传播·'+(s.prop_event==='outbreak'?'爆发升级':'异动/激增/KOL') : s.wo_event ? '📋 工单·'+(s.wo_event==='escalated'?'超时升级':'拆分分派') : s.crisis_status ? '🛟 危机·'+crisisStatus[s.crisis_status] : '🚨 预警' }}</span>
               </div>
               <small>{{ subDesc(s) }}</small>
               <div class="s-chs">
@@ -237,7 +247,7 @@ const taskLogs = ref([])
 const levels = [{ k: 'red', t: '红' }, { k: 'orange', t: '橙' }, { k: 'yellow', t: '黄' }]
 const chForm = ref({ name: '', type: 'webhook', target: '' })
 const subForm = ref({
-  name: '', mode: 'alert', alert_id: null, crisis_status: 'closed', wo_event: 'created', prop_event: 'outbreak', ext_event: 'submitted', stmt_event: 'chfail', topic: '',
+  name: '', mode: 'alert', alert_id: null, crisis_status: 'closed', wo_event: 'created', prop_event: 'outbreak', ext_event: 'submitted', stmt_event: 'chfail', rect_event: 'assigned', topic: '',
   levels: [], channel_ids: [], require_ack: false, ack_timeout_min: 30, escalate_channel_id: null, max_retry: 3
 })
 
@@ -253,6 +263,7 @@ function kindText(t) {
   if (t.kind === 'prop') return '🕸 传播'
   if (t.kind === 'ext') return '🤝 外部协作'
   if (t.kind === 'statement') return '📢 声明'
+  if (t.kind === 'rect') return '🛠 整改'
   if (t.kind === 'alert') return '🚨 预警'
   return '🛟 危机'
 }
@@ -268,6 +279,11 @@ function corrShort(c) {
     const phase = { partial: '部分失败督办', channels: '渠道失败', degrade: '降级发布知会', ackEsc: '回执升级' }[m[2]] || m[2]
     return `声明#${m[1]}·${phase}`
   }
+  m = String(c).match(/^rect(\d+):(\w+)/)
+  if (m) {
+    const phase = { dispatch: '分派', progress: '进度提交', review: '报验', remind: '催办', reject: '驳回', accept: '验收', ackEsc: '回执升级' }[m[2]] || m[2]
+    return `整改#${m[1]}·${phase}`
+  }
   return c.length > 14 ? c.slice(0, 14) + '…' : c
 }
 function logActionText(a) {
@@ -280,6 +296,7 @@ function logActionText(a) {
 function subDesc(s) {
   if (s.ext_event) return `外部协作方${s.ext_event === 'escalated' ? '紧急提交（升级督办）' : '提交证据/整改进度'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   if (s.stmt_event) return `危机声明${s.stmt_event === 'partial' ? '全部渠道登记完但存在失败（发布未完成、阻塞结案）' : s.stmt_event === 'degraded' ? '按策略降级发布（失败渠道终止并保留记录）' : '单个渠道发布失败'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
+  if (s.rect_event) return `危机整改事项${{ assigned: '分派/改派', submitted: '协作方提交整改进度', review: '提交报验/紧急报验', remind: '值班员催办', rejected: '验收驳回退回整改', accepted: '验收通过办结', created: '新建整改事项' }[s.rect_event] || s.rect_event}时通知`
   if (s.prop_event) return `传播路径${s.prop_event === 'outbreak' ? '进入爆发期（爆发升级）' : '热度激增 / KOL 加入'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   if (s.wo_event) return `协同工单${s.wo_event === 'escalated' ? '超时升级（两级）' : '拆分/分派'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   if (s.crisis_status) return `危机进入「${crisisStatus.value[s.crisis_status] || s.crisis_status}」时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
@@ -346,12 +363,13 @@ async function addSub() {
   await run(() => store.saveSub({
     name: f.name,
     alert_id: f.mode === 'alert' ? f.alert_id : null,
-    topic: ['wo', 'ext', 'stmt'].includes(f.mode) ? '' : f.topic,
+    topic: ['wo', 'ext', 'stmt', 'rect'].includes(f.mode) ? '' : f.topic,
     crisis_status: f.mode === 'crisis' ? f.crisis_status : '',
     wo_event: f.mode === 'wo' ? f.wo_event : '',
     prop_event: f.mode === 'prop' ? f.prop_event : '',
     ext_event: f.mode === 'ext' ? f.ext_event : '',
     stmt_event: f.mode === 'stmt' ? f.stmt_event : '',
+    rect_event: f.mode === 'rect' ? f.rect_event : '',
     levels: f.mode === 'alert' ? f.levels : [],
     channel_ids: f.channel_ids,
     require_ack: f.require_ack,
@@ -359,7 +377,7 @@ async function addSub() {
     escalate_channel_id: f.escalate_channel_id,
     max_retry: f.max_retry
   }))
-  subForm.value = { name: '', mode: 'alert', alert_id: null, crisis_status: 'closed', wo_event: 'created', prop_event: 'outbreak', ext_event: 'submitted', stmt_event: 'chfail', topic: '', levels: [], channel_ids: [], require_ack: false, ack_timeout_min: 30, escalate_channel_id: null, max_retry: 3 }
+  subForm.value = { name: '', mode: 'alert', alert_id: null, crisis_status: 'closed', wo_event: 'created', prop_event: 'outbreak', ext_event: 'submitted', stmt_event: 'chfail', rect_event: 'assigned', topic: '', levels: [], channel_ids: [], require_ack: false, ack_timeout_min: 30, escalate_channel_id: null, max_retry: 3 }
 }
 async function delSub(s) {
   if (!confirm(`删除订阅「${s.name}」？已生成的任务不受影响。`)) return

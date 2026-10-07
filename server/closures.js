@@ -10,6 +10,7 @@ import { db } from './db.js'
 import { now, addTimeline } from './pipeline.js'
 import { REPORT_STATUS } from './reports.js'
 import { recomputeWorkOrderState } from './dispatch.js'
+import { RECT_OPEN_STATUSES } from './rectify.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -39,6 +40,13 @@ export function closureReadiness(crisisId) {
   const openSubmissions = q(
     "SELECT id,code,title,status,is_urgent,kind FROM ext_submissions WHERE crisis_id=? AND status IN ('pending','reviewing') ORDER BY is_urgent DESC, id",
     crisisId)
+  // 危机整改事项：未达验收终态（待分派/整改中/待验收/已驳回）一律阻断，验收通过/已取消不阻断
+  const openRects = q(
+    `SELECT r.id,r.code,r.title,r.status,r.priority,p.name partner_name
+     FROM rect_items r LEFT JOIN ext_partners p ON p.id=r.partner_id
+     WHERE r.crisis_id=? AND r.status IN (${RECT_OPEN_STATUSES.map(() => '?').join(',')})
+     ORDER BY r.priority='urgent' DESC, r.id`, crisisId, ...RECT_OPEN_STATUSES)
+  const acceptedRectCount = q1("SELECT COUNT(*) c FROM rect_items WHERE crisis_id=? AND status='accepted'", crisisId).c
   const openAlerts = q("SELECT id,alert_id FROM alert_events WHERE crisis_id=? AND status='open'", crisisId)
   const inflightTasks = q(
     `SELECT id,title,status,kind,require_ack,work_order_id,escalated_from FROM notify_tasks
@@ -52,6 +60,7 @@ export function closureReadiness(crisisId) {
   if (openWorkOrders.length) blockers.push({ key: 'workorder', label: '未完结协同工单', count: openWorkOrders.length })
   if (openStatements.length) blockers.push({ key: 'statement', label: '未完结危机声明', count: openStatements.length })
   if (openSubmissions.length) blockers.push({ key: 'external', label: '待审核外部协作提交', count: openSubmissions.length })
+  if (openRects.length) blockers.push({ key: 'rect', label: '未办结危机整改事项', count: openRects.length })
   if (!report || report.status !== 'published') blockers.push({ key: 'report', label: '复盘报告未发布', count: 1 })
 
   return {
@@ -63,6 +72,8 @@ export function closureReadiness(crisisId) {
     statements: openStatements,
     degradedStatements,
     submissions: openSubmissions,
+    rects: openRects,
+    acceptedRectCount,
     openAlerts,
     inflightTasks,
     report: report
@@ -79,6 +90,7 @@ export function blockerError(rd) {
     if (b.key === 'workorder') return `${b.count} 个未完结协同工单（待分派/处理中/已阻塞，请先完成或取消）`
     if (b.key === 'statement') return `${b.count} 份未完结危机声明（起草/待审/发布中/部分渠道失败，请先完成发布或取消）`
     if (b.key === 'external') return `${b.count} 条待审核外部协作提交（待审核/受理中，请先受理后采纳、驳回或由提交方撤回）`
+    if (b.key === 'rect') return `${b.count} 项未办结危机整改事项（待分派/整改中/待验收/已驳回，请分派跟进并由管理员验收通过或取消）`
     return '复盘报告尚未审核发布（请完成跨角色编制并由管理员审核通过后再结案）'
   })
   return '结案统一守卫未通过：' + parts.join('；')
@@ -120,12 +132,14 @@ export function closeCrisis(crisisId, rawSummary = '') {
   }))
   // 守卫快照（冻结结案时点的全量口径，回溯面板展示，与历史空快照档案区分）
   const degradedStmtCount = q1("SELECT COUNT(*) c FROM crisis_statements WHERE crisis_id=? AND status='degraded'", crisisId).c
+  const acceptedRectCountNow = q1("SELECT COUNT(*) c FROM rect_items WHERE crisis_id=? AND status='accepted'", crisisId).c
   const guardSnapshot = {
     closedAt: ts,
     prevStatus: c.status,
     workOrders: { open: rd.workOrders.length },
     statements: { open: rd.statements.length, degraded: degradedStmtCount },
     submissions: { open: rd.submissions.length },
+    rects: { open: rd.rects.length, accepted: acceptedRectCountNow },
     alerts: { open: opens.length, resolved: opens.length },
     notifyTasks: { inflight: tasks.length, cancelled: tasks.length },
     report: rd.report ? { id: rd.report.id, title: rd.report.title, version: rd.report.publishedVersion || rd.report.version } : null
@@ -164,6 +178,7 @@ export function closeCrisis(crisisId, rawSummary = '') {
     if (opens.length) bits.push(`同步解除 ${opens.length} 条未解除预警${ruleNames.length ? '：' + ruleNames.join('、') : ''}`)
     if (tasks.length) bits.push(`联动中止 ${tasks.length} 条在途通知任务（回滚结案可恢复）`)
     if (degradedStmtCount) bits.push(`${degradedStmtCount} 份声明为降级发布（失败渠道已按策略降级终止并保留记录，不阻断结案）`)
+    if (acceptedRectCountNow) bits.push(`${acceptedRectCountNow} 项整改事项验收通过办结`)
     if (rd.report) bits.push(`复盘报告「${rd.report.title}」已发布（v${rd.report.publishedVersion || rd.report.version}）`)
     addTimeline(crisisId, '事件结案', bits.join('（'), ts)
     db.exec('COMMIT')

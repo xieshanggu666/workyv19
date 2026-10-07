@@ -25,6 +25,7 @@
       <WorkOrderView v-else-if="tab==='work'" />
       <ReportsView v-else-if="tab==='report'" />
       <ExtPortalView v-else-if="tab==='ext'" />
+      <RectifyView v-else-if="tab==='rect'" />
       <PartnerPortalView v-else-if="tab==='portal'" />
       <NotifyView v-else-if="tab==='notify'" />
     </main>
@@ -48,6 +49,7 @@ import StatementsView from '@/components/StatementsView.vue'
 import WorkOrderView from '@/components/WorkOrderView.vue'
 import ReportsView from '@/components/ReportsView.vue'
 import ExtPortalView from '@/components/ExtPortalView.vue'
+import RectifyView from '@/components/RectifyView.vue'
 import PartnerPortalView from '@/components/PartnerPortalView.vue'
 import NotifyView from '@/components/NotifyView.vue'
 
@@ -65,6 +67,7 @@ const tabs = [
   { key: 'work', icon: '📋', label: '协同工单', badge: () => store.stats.workOpen || 0 },
   { key: 'report', icon: '📝', label: '复盘报告', badge: () => store.stats.reportReviewing || 0 },
   { key: 'ext', icon: '🤝', label: '外部协作', badge: () => store.stats.extPending || 0 },
+  { key: 'rect', icon: '🛠', label: '危机整改', badge: () => (store.stats.rectReview || 0) + (store.stats.rectRejected || 0) + (store.stats.rectTodo || 0) },
   { key: 'portal', icon: '📮', label: '协作门户' },
   { key: 'notify', icon: '🔔', label: '通知中心', badge: () => store.stats.notifyOpen || 0 }
 ]

@@ -5,7 +5,7 @@
       <div class="gate-card">
         <div class="gate-logo">📮</div>
         <h2>舆舟 · 外部协作反馈门户</h2>
-        <p class="gate-desc">品牌方、监管方、媒体可在此提交<b>证据材料</b>与<b>整改进度</b>，材料经内部审核后将回写处置工单与危机时间线；紧急事项将立即联动内部升级。</p>
+        <p class="gate-desc">品牌方、监管方、媒体可在此提交<b>证据材料</b>与<b>整改进度</b>，材料经内部审核后将回写处置工单与危机时间线；被分派的<b>危机整改事项</b>可在此持续提交进度并报验，紧急事项将立即联动内部升级。</p>
         <div class="quick">
           <span class="q-lbl">演示身份（点击快捷进入）：</span>
           <button v-for="c in quick" :key="c.code" class="q-btn" :class="c.kind" @click="login(c.code)">
@@ -35,6 +35,70 @@
       </div>
 
       <p class="hint">📌 提交后状态流转：<b>待审核 → 受理中 → 已采纳 / 已驳回</b>；已采纳材料将并入危机处置档案，可在下方查看内部审核意见；被驳回时可补充材料后重新提交。</p>
+
+      <!-- ===== 分派给本协作方的危机整改事项：提交整改进度 / 报验 ===== -->
+      <div v-if="rects.length" class="rect-block">
+        <h3>🛠 分派给我方的危机整改事项 <i>{{ rects.length }}</i></h3>
+        <p class="rect-hint">按整改要求落实并分批提交进度；完成后<b>提交报验</b>由内部管理员验收，驳回时可补充材料后重新报验。</p>
+        <div class="rect-list">
+          <div v-for="r in rects" :key="r.id" class="rect-card" :class="[r.status,{urgent:r.priority==='urgent' && !['accepted','cancelled'].includes(r.status)}]">
+            <div class="rc-head">
+              <span class="code">{{ r.code }}</span>
+              <span class="st" :class="r.status">{{ r.statusText }}</span>
+              <span v-if="r.priority==='urgent'" class="urg">⚡ 紧急</span>
+              <b>{{ r.title }}</b>
+            </div>
+            <div class="rc-meta">
+              <span>事件 <i>#{{ r.crisis_id }} {{ r.crisis_title }}</i></span>
+              <span v-if="r.due_at">期限 <i>{{ r.due_at }}</i></span>
+              <span v-if="r.follower">内部跟进人 <i>{{ r.follower }}</i></span>
+            </div>
+            <pre class="rc-req">{{ r.requirement }}</pre>
+            <div v-if="r.status==='rejected'" class="rc-reject">↩ 验收驳回：{{ r.reject_reason }}（{{ r.rejected_by }}）——请补充整改进度后重新报验</div>
+            <div v-if="r.status==='accepted'" class="rc-accept">✔ 已验收通过（{{ r.accepted_by }} · {{ r.accepted_at }}）<template v-if="r.accepted_note">：{{ r.accepted_note }}</template></div>
+            <div v-if="r.status==='review'" class="rc-review">⏳ 已提交报验，等待管理员验收（第 {{ r.review_round }} 轮）</div>
+
+            <div v-if="fullRectId===r.id && fullRect" class="rc-logs">
+              <div v-for="p in [...fullRect.progress].reverse()" :key="p.id" class="rcl" :class="p.operator_side">
+                <span class="side">{{ sideText(p.operator_side) }}</span>
+                <b>{{ rectActionText(p.action) }}<i v-if="p.is_urgent" class="u"> ⚡紧急</i></b>
+                <span class="c">{{ p.content }}</span>
+                <div v-if="p.attachments && p.attachments.length" class="atts">
+                  📎 <span v-for="(a,i) in p.attachments" :key="i" class="att">{{ a.name }}<i v-if="a.size">（{{ fmtSize(a.size) }}）</i></span>
+                </div>
+                <em>{{ p.operator }} · {{ p.time }}</em>
+              </div>
+            </div>
+
+            <!-- 提交进度/报验表单 -->
+            <form v-if="canSubmit(r)" class="rc-form" @submit.prevent="submitRect(r, false)">
+              <textarea v-model="rectForms[r.id].content" :placeholder="r.status==='review' ? '已在验收中，可继续补充进度说明…' : '填写本期整改进度：已完成措施、覆盖率、剩余问题与计划…'" required></textarea>
+              <div class="rc-frow">
+                <input v-model="rectForms[r.id].source_url" placeholder="佐证链接（可留空）" />
+                <input v-model="rectForms[r.id].contact_info" placeholder="本次对接联系方式（可留空）" />
+              </div>
+              <div class="atts-edit">
+                <span class="lbl">📎 附件清单（演示登记文件信息，不上传实体文件）</span>
+                <div v-for="(a,i) in rectForms[r.id].attachments" :key="i" class="att-row">
+                  <input v-model="a.name" placeholder="文件名，如 整改台账.pdf" />
+                  <input v-model.number="a.size" type="number" min="0" placeholder="大小(字节)" style="max-width:110px" />
+                  <input v-model="a.type" placeholder="类型" style="max-width:160px" />
+                  <button type="button" class="del-att" @click="rectForms[r.id].attachments.splice(i,1)">✕</button>
+                </div>
+                <button type="button" class="add-att" @click="rectForms[r.id].attachments.push({name:'',size:0,type:''})">＋ 添加附件</button>
+              </div>
+              <div class="rc-btns">
+                <button class="prog" type="submit" :disabled="r.status==='review'">📈 提交进度</button>
+                <button class="rev" type="button" :disabled="r.status==='review'" @click="submitRect(r, true)">✔ 提交报验（管理员验收）</button>
+                <label class="urg-check"><input type="checkbox" v-model="rectForms[r.id].is_urgent" /> ⚡ 紧急报验（立即升级通知内部）</label>
+              </div>
+            </form>
+            <div class="rc-actions">
+              <button class="op logbtn" @click="toggleRectLogs(r)">{{ fullRectId===r.id ? '收起留痕' : '🧾 整改留痕（'+r.progress_count+'）' }}</button>
+            </div>
+          </div>
+        </div>
+      </div>
 
       <!-- 提交表单 -->
       <form v-if="showForm" class="sub-form" @submit.prevent="submit">
@@ -124,7 +188,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { usePubStore } from '@/store/pub'
 
 const store = usePubStore()
@@ -138,9 +202,25 @@ const loginError = ref('')
 const partner = ref(null)
 const crises = ref([])
 const mine = ref([])
+const rects = ref([])
 const showForm = ref(false)
 const logId = ref(null)
 const form = ref(blankForm())
+// 危机整改事项：每项一个进度表单（附件/紧急报验），详情留痕抽屉
+const rectForms = reactive({})
+const fullRectId = ref(null)
+const fullRect = ref(null)
+
+function blankRectForm() {
+  return { content: '', source_url: '', contact_info: '', is_urgent: false, attachments: [] }
+}
+function ensureRectForm(id) {
+  if (!rectForms[id]) rectForms[id] = blankRectForm()
+}
+function canSubmit(r) { return !['accepted', 'cancelled'].includes(r.status) }
+function rectActionText(a) {
+  return { create: '新建', assign: '分派跟进', progress: '提交进度', submit: '提交报验', review: '报验登记', remind: '催办', accept: '验收通过', reject: '验收驳回', cancel: '取消' }[a] || a
+}
 
 function blankForm() {
   return { doc_type: 'evidence', crisis_id: null, title: '', content: '', source_url: '', contact_info: '', is_urgent: false, attachments: [] }
@@ -165,6 +245,8 @@ async function login(code) {
     partner.value = d.partner
     crises.value = d.crises
     mine.value = d.mine
+    rects.value = d.rects || []
+    rects.value.forEach((r) => ensureRectForm(r.id))
   } catch (e) {
     partner.value = null
     loginError.value = e.message || '门户口令无效'
@@ -173,6 +255,8 @@ async function login(code) {
 function logout() {
   partner.value = null
   mine.value = []
+  rects.value = []
+  Object.keys(rectForms).forEach((k) => delete rectForms[k])
   inputCode.value = ''
   store.setPortalCode('')
 }
@@ -183,6 +267,14 @@ async function refresh() {
   partner.value = d.partner
   crises.value = d.crises
   mine.value = d.mine
+  rects.value = d.rects || []
+  rects.value.forEach((r) => ensureRectForm(r.id))
+  if (fullRectId.value) {
+    const cur = rects.value.find((x) => x.id === fullRectId.value)
+    if (cur) {
+      fullRect.value = await store.portalFetchRect(cur.id).catch(() => null)
+    }
+  }
 }
 async function submit() {
   // 清理空附件行
@@ -210,6 +302,30 @@ async function toggleLogs(s) {
     const idx = mine.value.findIndex((x) => x.id === s.id)
     if (idx >= 0) mine.value[idx] = full
   }
+}
+
+async function submitRect(r, submit) {
+  const f = rectForms[r.id]
+  if (!f || !f.content.trim()) return
+  if (submit && !confirm('确认提交报验？提交后将由内部管理员验收。' + (f.is_urgent ? '\n（已标记紧急，将立即升级通知内部）' : ''))) return
+  const body = {
+    content: f.content.trim(),
+    source_url: f.source_url.trim(),
+    contact_info: f.contact_info.trim(),
+    is_urgent: submit ? !!f.is_urgent : false,
+    attachments: f.attachments.filter((a) => a.name && a.name.trim()),
+    submit
+  }
+  try {
+    await store.portalRectProgress(r.id, body)
+    rectForms[r.id] = blankRectForm()
+    await refresh()
+  } catch (e) { store.msg(e.message, 'warn') }
+}
+async function toggleRectLogs(r) {
+  if (fullRectId.value === r.id) { fullRectId.value = null; fullRect.value = null; return }
+  fullRectId.value = r.id
+  fullRect.value = await store.portalFetchRect(r.id)
 }
 
 let timer = null
@@ -303,4 +419,62 @@ onUnmounted(() => clearInterval(timer))
 .mlog b{min-width:56px;color:#dbe4f3;}
 .mlog span{color:#aebadd;flex:1;min-width:180px;}
 .mlog em{color:#6f84ab;font-style:normal;font-size:11px;}
+/* 危机整改事项 */
+.rect-block{background:linear-gradient(160deg,#0c211d,#0c1730);border:1px solid rgba(38,166,154,.3);border-radius:14px;padding:14px 16px;display:flex;flex-direction:column;gap:10px;}
+.rect-block h3{margin:0;font-size:15px;color:#80cbc4;display:flex;align-items:center;gap:8px;}
+.rect-block h3 i{font-style:normal;font-size:11px;background:#0a2320;border:1px solid rgba(38,166,154,.4);border-radius:9px;padding:1px 9px;color:#aebadd;}
+.rect-hint{margin:0;font-size:12px;color:#aebadd;line-height:1.7;}
+.rect-list{display:flex;flex-direction:column;gap:10px;}
+.rect-card{background:#0c1a30;border:1px solid rgba(120,160,220,0.16);border-radius:11px;padding:12px 14px;border-left:4px solid #546e7a;}
+.rect-card.urgent{border-left-color:#ef5350;}
+.rect-card.review{border-left-color:#ffa726;}
+.rect-card.accepted{border-left-color:#66bb6a;}
+.rect-card.rejected{border-left-color:#ab47bc;}
+.rect-card.progress{border-left-color:#26a69a;}
+.rc-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;}
+.rc-head .code{font-family:monospace;background:#0a1224;border:1px solid rgba(38,166,154,.4);border-radius:5px;padding:2px 8px;font-size:11px;color:#80cbc4;}
+.rc-head .st{font-size:11px;padding:2px 9px;border-radius:10px;font-weight:700;}
+.rc-head .st.todo{background:#37474f;color:#cfd8dc;}
+.rc-head .st.progress{background:#0d2b4d;color:#90caf9;}
+.rc-head .st.review{background:#5d3a10;color:#ffcc80;}
+.rc-head .st.rejected{background:#3d1a4d;color:#ce93d8;}
+.rc-head .st.accepted{background:#143d1c;color:#a5d6a7;}
+.rc-head .st.cancelled{background:#263238;color:#90a4ae;}
+.rc-head .urg{font-size:10px;color:#fff;background:#c62828;border-radius:9px;padding:2px 8px;font-weight:700;}
+.rc-head b{font-size:13px;}
+.rc-meta{display:flex;gap:13px;flex-wrap:wrap;margin:7px 0;font-size:11px;color:#8ba2c8;}
+.rc-meta i{color:#dbe4f3;font-style:normal;}
+.rc-req{white-space:pre-wrap;margin:0 0 8px;background:#0a1428;border-radius:8px;padding:9px 11px;font-family:inherit;font-size:12px;line-height:1.6;color:#c6d3ea;}
+.rc-reject{background:#3d1a4d33;border:1px solid #8e24aa80;color:#ce93d8;border-radius:8px;padding:7px 11px;font-size:12px;margin-bottom:8px;}
+.rc-accept{background:#143d1c55;border:1px solid #43a04780;color:#a5d6a7;border-radius:8px;padding:7px 11px;font-size:12px;margin-bottom:8px;}
+.rc-review{background:#5d3a1044;border:1px solid #ffa72680;color:#ffcc80;border-radius:8px;padding:7px 11px;font-size:12px;margin-bottom:8px;}
+.rc-form{background:#0a1428;border:1px solid rgba(120,160,220,0.16);border-radius:10px;padding:11px;display:flex;flex-direction:column;gap:8px;margin-bottom:8px;}
+.rc-form textarea{background:#13233f;border:1px solid rgba(120,160,220,0.25);color:#dbe4f3;border-radius:8px;padding:9px 11px;font-size:13px;font-family:inherit;min-height:90px;resize:vertical;}
+.rc-frow{display:flex;gap:8px;flex-wrap:wrap;}
+.rc-frow input{flex:1;min-width:180px;background:#13233f;border:1px solid rgba(120,160,220,0.25);color:#dbe4f3;border-radius:8px;padding:8px 10px;font-size:12px;font-family:inherit;}
+.rc-form .atts-edit{display:flex;flex-direction:column;gap:6px;}
+.rc-form .att-row{display:flex;gap:6px;}
+.rc-form .att-row input{flex:1;min-width:0;font-size:12px;padding:6px 8px;background:#13233f;border:1px solid rgba(120,160,220,0.25);color:#dbe4f3;border-radius:7px;}
+.rc-form .del-att{background:transparent;border:1px solid rgba(239,83,80,.5);color:#ef9a9a;border-radius:7px;width:34px;cursor:pointer;}
+.rc-form .add-att{align-self:flex-start;background:transparent;border:1px dashed rgba(120,160,220,0.4);color:#90caf9;border-radius:7px;padding:5px 11px;font-size:12px;cursor:pointer;}
+.rc-btns{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+.rc-btns .prog{background:#00695c;border:1px solid #26a69a;color:#e0f2f1;border-radius:8px;padding:8px 15px;font-size:12px;font-weight:600;cursor:pointer;}
+.rc-btns .rev{background:#e65100;border:1px solid #fb8c00;color:#fff3e0;border-radius:8px;padding:8px 15px;font-size:12px;font-weight:600;cursor:pointer;}
+.rc-btns button:disabled{opacity:.5;cursor:not-allowed;}
+.urg-check{font-size:12px;color:#ffb74d;display:flex;align-items:center;gap:6px;margin-left:auto;}
+.rc-actions{display:flex;gap:8px;}
+.rc-actions .op{border-radius:7px;padding:6px 12px;font-size:12px;cursor:pointer;background:transparent;border:1px solid rgba(120,160,220,0.35);color:#aebadd;}
+.rc-logs{margin-bottom:8px;border-top:1px dashed rgba(120,160,220,0.18);padding-top:8px;display:flex;flex-direction:column;gap:6px;max-height:260px;overflow-y:auto;}
+.rcl{display:flex;flex-direction:column;gap:2px;font-size:12px;background:#0f1d38;border-radius:8px;padding:7px 10px;border-left:3px solid #546e7a;}
+.rcl.external{border-left-color:#26a69a;}
+.rcl.internal{border-left-color:#42a5f5;}
+.rcl.system{border-left-color:#78909c;}
+.rcl .side{font-size:10px;color:#8ba2c8;font-weight:700;}
+.rcl b{color:#dbe4f3;}
+.rcl b .u{color:#ef9a9a;font-style:normal;}
+.rcl .c{color:#aebadd;white-space:pre-wrap;}
+.rcl .atts{display:flex;gap:6px;flex-wrap:wrap;color:#8ba2c8;}
+.rcl .atts .att{background:#0a1428;border-radius:6px;padding:1px 7px;font-size:11px;}
+.rcl .atts i{color:#6f84ab;font-style:normal;margin-left:3px;}
+.rcl em{font-style:normal;font-size:10px;color:#6f84ab;}
 </style>

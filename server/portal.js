@@ -3,6 +3,7 @@
 // 审核采纳后回写协同工单、联动解除预警并写入危机统一时间线，同时复用通知编排完成提交提醒/紧急升级联动。
 import { db } from './db.js'
 import { now, addTimeline } from './pipeline.js'
+import { listPartnerRectItems } from './rectify.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -192,15 +193,16 @@ export function crisisSubmissionBrief(crisisId) {
     : null
 }
 
-// 门户首页：协作方信息 + 可关联的未结案危机（只读标题/级别/状态）
+// 门户首页：协作方信息 + 可关联的未结案危机（只读标题/级别/状态）+ 本人历史提交 + 被指派的危机整改事项
 export function portalBootstrap(partner) {
   const crises = q("SELECT id,title,level,status,topic FROM crisis WHERE status!='closed' ORDER BY id DESC")
     .map((c) => ({ ...c, levelText: { red: '红色', orange: '橙色', yellow: '黄色' }[c.level] || c.level }))
   const mine = listPartnerSubmissions(partner.id)
+  const rects = listPartnerRectItems(partner.id)
   return {
     partner: { id: partner.id, name: partner.name, kind: partner.kind, kindText: PARTNER_KIND[partner.kind], contact: partner.contact },
-    crises, mine,
-    dict: { docType: DOC_TYPE, status: SUB_STATUS }
+    crises, mine, rects,
+    dict: { docType: DOC_TYPE, status: SUB_STATUS, rectStatus: { todo: '待分派', progress: '整改中', review: '待验收', accepted: '已验收', rejected: '已驳回', cancelled: '已取消' } }
   }
 }
 

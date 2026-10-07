@@ -45,6 +45,9 @@
           <span v-if="c.extPortal" class="ext-badge" :class="{urgent:c.extPortal.urgent}" @click="gotoExt(c)" title="查看外部协作反馈">
             🤝 外部协作<template v-if="c.extPortal.open"> · 待审 {{ c.extPortal.open }}<template v-if="c.extPortal.urgent">（⚡{{ c.extPortal.urgent }}）</template></template><template v-else> · 已采纳 {{ c.extPortal.accepted }}</template>
           </span>
+          <span v-if="c.rect" class="rect-badge" :class="{open:c.rect.open,review:c.rect.review,urgent:c.rect.urgent}" @click="gotoRect(c)" title="查看危机整改事项">
+            🛠 危机整改<template v-if="c.rect.open"> · 在办 {{ c.rect.open }}<template v-if="c.rect.review">（待验收 {{ c.rect.review }}）</template></template><template v-else> · 已验收 {{ c.rect.accepted }}</template>
+          </span>
           <span class="st" :class="c.status">{{ stText(c.status) }}</span>
           <button class="del" @click="del(c)">✕</button>
         </div>
@@ -75,11 +78,12 @@
           <h5>🕒 处置时间线</h5>
           <div class="tl">
             <div v-for="(t,i) in c.timeline" :key="t.id" class="tl-item">
-              <span class="tl-dot" :class="{latest:i===0, linked:['workorder','ext'].includes(t.ref_type)}"></span>
+              <span class="tl-dot" :class="{latest:i===0, linked:['workorder','ext','rect'].includes(t.ref_type)}"></span>
               <div class="tl-body">
                 <b>{{ t.action }}
                   <span v-if="t.ref_type==='workorder'" class="tl-link" @click.stop="openTimelineWorkOrder(t)">📋 #{{ t.ref_id }} →</span>
                   <span v-else-if="t.ref_type==='ext'" class="tl-link ext" @click.stop="openTimelineExt(t)">🤝 {{ t.note.match(/（(EXT-\d+)）/)?.[1] || ('#'+t.ref_id) }} →</span>
+                  <span v-else-if="t.ref_type==='rect'" class="tl-link rect" @click.stop="openTimelineRect(t)">🛠 {{ t.note.match(/(RECT-\d+)/)?.[1] || ('#'+t.ref_id) }} →</span>
                 </b>
                 <span>{{ t.note }}</span>
                 <em>{{ t.time }}</em>
@@ -129,7 +133,7 @@
               </span>
               <span v-if="closureGuard(cl)" class="cl-guard">
                 🛡 结案守卫：工单 {{ closureGuard(cl).workOrders.open }} 在办 · 声明 {{ closureGuard(cl).statements.open }} 在办<template v-if="closureGuard(cl).statements.degraded"> · 降级发布 {{ closureGuard(cl).statements.degraded }}</template>
-                · 外部提交 {{ closureGuard(cl).submissions.open }} 待审 · 报告{{ closureGuard(cl).report ? ' 已发布 v' + closureGuard(cl).report.version : '—' }}
+                · 外部提交 {{ closureGuard(cl).submissions.open }} 待审 · 整改 {{ closureGuard(cl).rects?.open ?? 0 }} 在办<template v-if="closureGuard(cl).rects?.accepted">（已验收 {{ closureGuard(cl).rects.accepted }}）</template> · 报告{{ closureGuard(cl).report ? ' 已发布 v' + closureGuard(cl).report.version : '—' }}
               </span>
               <span v-if="closureCascade(cl)" class="cl-cascade">
                 🔗 联动：解除预警 {{ closureCascade(cl).alerts }} 条 · 中止通知 {{ closureCascade(cl).tasks }} 条<template v-if="cl.rolled_back">（回滚已恢复）</template>
@@ -165,6 +169,12 @@
                 <b v-if="guardCount('external')">{{ guardCount('external') }} 条待审核</b>
                 <button v-if="guardCount('external')" class="mini-link" @click="gotoExt(c)">去审核 →</button>
               </li>
+              <li :class="{ok: !guardCount('rect'), bad: guardCount('rect')}">
+                <i>{{ guardCount('rect') ? '✕' : '✔' }}</i>危机整改事项全部验收通过
+                <b v-if="guardCount('rect')">{{ guardCount('rect') }} 项未办结</b>
+                <button v-if="guardCount('rect')" class="mini-link" @click="gotoRect(c)">去跟进/验收 →</button>
+                <span v-if="!guardCount('rect') && acceptedRectCount()" class="guard-note">{{ acceptedRectCount() }} 项已验收通过</span>
+              </li>
               <li :class="{ok: reportPublished, bad: !reportPublished}">
                 <i>{{ reportPublished ? '✔' : '✕' }}</i>复盘报告已审核发布
                 <b v-if="!reportPublished">{{ review.readiness.report ? review.readiness.report.statusText : '尚未建档' }}</b>
@@ -195,6 +205,7 @@
           <button class="ghost" @click="addStep(c)">＋ 记录处置</button>
           <button v-if="c.status==='monitoring'||c.status==='disposal'" class="prog" @click="advance(c)">推进处置</button>
           <button v-if="c.status!=='closed'" class="wo-btn" @click="splitWorkOrder(c)">📋 拆分工单</button>
+          <button v-if="isOps" class="rect-btn" @click="gotoRect(c)">🛠 整改事项</button>
           <button v-if="c.status!=='closed' || c.statement" class="stmt-btn" @click="gotoStmt(c)">{{ c.statement ? '📢 查看声明' : '📢 危机声明' }}</button>
           <button v-if="c.report || isOps" class="report-btn" @click="gotoReport(c)">📝 {{ c.report ? '复盘报告' : '编制复盘' }}</button>
           <button class="ghost" @click="toggleReview(c)">{{ reviewId===c.id ? '收起回溯' : '🔍 回溯' }}</button>
@@ -283,6 +294,18 @@ function openTimelineExt(t) {
   store.extOpenId = t.ref_id
   store.tab = 'ext'
 }
+// 跳转危机整改看板并按该危机过滤
+function gotoRect(c) {
+  store.rectFilterCrisis = c.id
+  store.rectOpenId = null
+  store.tab = 'rect'
+}
+// 从时间线锚点跳转整改事项详情（自动展开留痕抽屉）
+function openTimelineRect(t) {
+  store.rectFilterCrisis = t.crisis_id
+  store.rectOpenId = t.ref_id
+  store.tab = 'rect'
+}
 async function reopen(c) {
   const note = prompt(`回滚结案「${c.title}」：结案时联动解除的预警、中止的在途通知任务将精确恢复，事件重回处置流程。\n回滚说明（可留空）：`)
   if (note == null) return
@@ -294,7 +317,10 @@ function kindText(k) { return { manual: '手动解除', batch: '批量解除', c
 function guardCount(key) {
   const rd = review.value?.readiness
   if (!rd) return 0
-  return { workorder: rd.workOrders.length, statement: rd.statements.length, external: rd.submissions.length }[key] || 0
+  return { workorder: rd.workOrders.length, statement: rd.statements.length, external: rd.submissions.length, rect: rd.rects.length }[key] || 0
+}
+function acceptedRectCount() {
+  return review.value?.readiness?.acceptedRectCount || 0
 }
 const reportPublished = computed(() => review.value?.readiness?.report?.status === 'published')
 // 已降级发布的声明为发布终态（不阻断守卫），在清单中以提示口径展示
@@ -381,6 +407,10 @@ textarea{resize:vertical;min-height:52px;}
 .ext-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#261a3d;color:#ce93d8;border:1px solid rgba(142,36,170,.45);cursor:pointer;}
 .ext-badge.urgent{background:#3d1414;color:#ff8a80;border-color:rgba(239,83,80,.6);animation:extpulse 1.2s infinite;}
 @keyframes extpulse{50%{box-shadow:0 0 0 3px rgba(239,83,80,.18);}}
+.rect-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2e2b;color:#80cbc4;border:1px solid rgba(0,150,136,.4);cursor:pointer;}
+.rect-badge.open{background:#0d302c;color:#80cbc4;border-color:rgba(38,166,154,.5);}
+.rect-badge.review{background:#3d2a07;color:#ffcc80;border-color:rgba(255,167,38,.5);}
+.rect-badge.urgent{background:#3d1414;color:#ff8a80;border-color:rgba(239,83,80,.6);}
 .st{font-size:11px;padding:2px 10px;border-radius:6px;}
 .st.monitoring{background:#37474f;color:#b0bec5;}.st.disposal{background:#b71c1c;color:#ffcdd2;}.st.closed{background:#1b5e20;color:#a5d6a7;}
 .del{background:none;border:none;color:#ef5350;font-size:15px;cursor:pointer;}
@@ -407,6 +437,8 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .tl-link:hover{background:#10433d;}
 .tl-link.ext{color:#ce93d8;background:#241636;border-color:rgba(142,36,170,.4);}
 .tl-link.ext:hover{background:#341d4d;}
+.tl-link.rect{color:#80cbc4;background:#0c2622;border-color:rgba(38,166,154,.4);}
+.tl-link.rect:hover{background:#10433d;}
 .tl-body b{color:#dbe4f3;font-size:12px;display:block;}
 .tl-body span{color:#8ba2c8;font-size:11px;}
 .tl-body em{color:#5b6f94;font-size:10px;font-style:normal;display:block;margin-top:2px;}
@@ -473,6 +505,7 @@ button.close:disabled{opacity:.55;cursor:not-allowed;background:linear-gradient(
 .actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;}
 .prog{background:linear-gradient(135deg,#ef6c00,#e65100);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .wo-btn{background:linear-gradient(135deg,#00897b,#00695c);border:none;color:#fff;font-weight:600;cursor:pointer;}
+.rect-btn{background:linear-gradient(135deg,#00838f,#006064);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .stmt-btn{background:linear-gradient(135deg,#00838f,#006064);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .report-btn{background:linear-gradient(135deg,#7b1fa2,#4a148c);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .close{background:linear-gradient(135deg,#2e7d32,#1b5e20);border:none;color:#fff;font-weight:600;cursor:pointer;}

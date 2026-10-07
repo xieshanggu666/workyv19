@@ -2,6 +2,7 @@ import { db } from './db.js'
 import { now, addTimeline } from './pipeline.js'
 import { ROLE_TEXT } from './notify.js'
 import { deliveryRollup, crisisDispatchSummary } from './dispatch.js'
+import { rectSnapshot } from './rectify.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -186,13 +187,16 @@ export function buildSnapshot(crisisId) {
     }))
   }
 
+  // ---- 危机整改事项：外部协作方落实、值班员跟进、管理员验收（含整改进度/报验轮次/驳回记录，与结案守卫同口径） ----
+  const rectifications = rectSnapshot(crisisId)
+
   return {
     generatedAt: now(),
     crisis: {
       id: c.id, title: c.title, level: c.level, status: c.status, topic: c.topic,
       keyword: c.keyword, origin: c.origin, created: c.created, updated: c.updated
     },
-    alerts, timeline, propagation, workOrders, notifications, closures, statements, externalFeedback
+    alerts, timeline, propagation, workOrders, notifications, closures, statements, externalFeedback, rectifications
   }
 }
 
